@@ -90,6 +90,11 @@ fn main() -> Result<()> {
     let user = UserId::new(cfg.tenant.default_user_id.clone());
     let tenant = TenantId::new(cfg.tenant.id.clone());
     let tenant_dir = paths.tenant_dir(&tenant);
+    let audit = AuditContext {
+        tenant_dir: &tenant_dir,
+        tenant: &tenant,
+        user: &user,
+    };
 
     match cli.command {
         Command::Init => {
@@ -138,9 +143,7 @@ fn main() -> Result<()> {
             ) {
                 CandidateRoute::RejectSecret => {
                     append_audit_event(
-                        &tenant_dir,
-                        &tenant,
-                        &user,
+                        &audit,
                         candidate.scope,
                         AuditAction::CandidateRejectedSecret,
                         Some(candidate.id.clone()),
@@ -152,9 +155,7 @@ fn main() -> Result<()> {
                 CandidateRoute::PendingReview => {
                     append_candidate(&inbox, &candidate)?;
                     append_audit_event(
-                        &tenant_dir,
-                        &tenant,
-                        &user,
+                        &audit,
                         candidate.scope,
                         AuditAction::CandidateQueued,
                         Some(candidate.id.clone()),
@@ -168,9 +169,7 @@ fn main() -> Result<()> {
                     let path = memory_path(&paths, &tenant, &user, &memory)?;
                     write_memory(&path, &memory)?;
                     append_audit_event(
-                        &tenant_dir,
-                        &tenant,
-                        &user,
+                        &audit,
                         candidate.scope,
                         AuditAction::CandidateAutoAccepted,
                         Some(candidate.id.clone()),
@@ -178,9 +177,7 @@ fn main() -> Result<()> {
                         None,
                     )?;
                     append_audit_event(
-                        &tenant_dir,
-                        &tenant,
-                        &user,
+                        &audit,
                         candidate.scope,
                         AuditAction::MemoryWritten,
                         None,
@@ -223,9 +220,7 @@ fn main() -> Result<()> {
                 },
             )?;
             append_audit_event(
-                &tenant_dir,
-                &tenant,
-                &user,
+                &audit,
                 candidate.scope,
                 AuditAction::CandidateEdited,
                 Some(id.clone()),
@@ -268,9 +263,7 @@ fn main() -> Result<()> {
                 },
             )?;
             append_audit_event(
-                &tenant_dir,
-                &tenant,
-                &user,
+                &audit,
                 candidate.scope,
                 AuditAction::CandidateMerged,
                 Some(id.clone()),
@@ -300,9 +293,7 @@ fn main() -> Result<()> {
             let path = memory_path(&paths, &tenant, &user, &memory)?;
             write_memory(&path, &memory)?;
             append_audit_event(
-                &tenant_dir,
-                &tenant,
-                &user,
+                &audit,
                 candidate.scope,
                 AuditAction::CandidateAccepted,
                 Some(id.clone()),
@@ -310,9 +301,7 @@ fn main() -> Result<()> {
                 None,
             )?;
             append_audit_event(
-                &tenant_dir,
-                &tenant,
-                &user,
+                &audit,
                 candidate.scope,
                 AuditAction::MemoryWritten,
                 None,
@@ -343,9 +332,7 @@ fn main() -> Result<()> {
                 },
             )?;
             append_audit_event(
-                &tenant_dir,
-                &tenant,
-                &user,
+                &audit,
                 candidate.scope,
                 AuditAction::CandidateRejected,
                 Some(id.clone()),
@@ -380,9 +367,7 @@ fn main() -> Result<()> {
             let _tenant_lock = FileLock::exclusive(tenant_dir.join("tenant.lock"))?;
             noema_core::vacuum::compact_hippocampus(&tenant_dir)?;
             append_audit_event(
-                &tenant_dir,
-                &tenant,
-                &user,
+                &audit,
                 Scope::User,
                 AuditAction::VacuumCompacted,
                 None,
@@ -445,21 +430,25 @@ fn memory_path(
     Ok(dir.join(format!("{}.md", memory.id)))
 }
 
+struct AuditContext<'a> {
+    tenant_dir: &'a Path,
+    tenant: &'a TenantId,
+    user: &'a UserId,
+}
+
 fn append_audit_event(
-    tenant_dir: &Path,
-    tenant: &TenantId,
-    user: &UserId,
+    audit: &AuditContext<'_>,
     scope: Scope,
     action: AuditAction,
     candidate_id: Option<CandidateId>,
     memory_id: Option<MemoryId>,
     reason: Option<String>,
 ) -> Result<()> {
-    let mut event = AuditEvent::new(tenant.clone(), user.clone(), scope, action);
+    let mut event = AuditEvent::new(audit.tenant.clone(), audit.user.clone(), scope, action);
     event.candidate_id = candidate_id;
     event.memory_id = memory_id;
     event.reason = reason;
-    append_audit(tenant_dir, &event)?;
+    append_audit(audit.tenant_dir, &event)?;
     Ok(())
 }
 

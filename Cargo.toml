@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/noema-core",
   "crates/noema-cli",
+  "crates/noema-mcp",
 ]
 
 [workspace.package]

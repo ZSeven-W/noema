@@ -72,7 +72,13 @@ mod tests {
             let path = path.clone();
             handles.push(std::thread::spawn(move || {
                 for seq in 0..50 {
-                    append_jsonl(path.as_path(), &Row { value: format!("{worker}:{seq}") }).unwrap();
+                    append_jsonl(
+                        path.as_path(),
+                        &Row {
+                            value: format!("{worker}:{seq}"),
+                        },
+                    )
+                    .unwrap();
                 }
             }));
         }

@@ -17,7 +17,11 @@ impl FileLock {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new().create(true).read(true).write(true).open(&path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
         file.lock_exclusive()?;
         Ok(Self { file, path })
     }

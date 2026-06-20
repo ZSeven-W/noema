@@ -29,3 +29,7 @@ tempfile.workspace = true
 [[test]]
 name = "s3_fake"
 path = "../../tests/s3_fake.rs"
+
+[[test]]
+name = "enterprise_policy"
+path = "../../tests/enterprise_policy.rs"

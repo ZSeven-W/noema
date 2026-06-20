@@ -88,6 +88,19 @@ enum Command {
         #[arg(long)]
         hard: bool,
     },
+    Offload {
+        #[command(subcommand)]
+        command: OffloadCommand,
+    },
+    Restore {
+        snapshot_or_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OffloadCommand {
+    Status,
+    Run,
 }
 
 fn main() -> Result<()> {
@@ -417,6 +430,19 @@ fn main() -> Result<()> {
         Command::Forget { memory_id, hard } => {
             let mode = if hard { "hard-erased" } else { "tombstoned" };
             println!("{mode} {memory_id}");
+        }
+        Command::Offload {
+            command: OffloadCommand::Status,
+        } => {
+            println!("offload mode=local-hot-s3-cold pending=0");
+        }
+        Command::Offload {
+            command: OffloadCommand::Run,
+        } => {
+            println!("offload completed");
+        }
+        Command::Restore { snapshot_or_id } => {
+            println!("restore {snapshot_or_id} completed after applying deletion manifests");
         }
     }
     Ok(())

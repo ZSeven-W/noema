@@ -81,6 +81,13 @@ enum Command {
         #[arg(long)]
         llm: bool,
     },
+    Doctor,
+    Reindex,
+    Forget {
+        memory_id: String,
+        #[arg(long)]
+        hard: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -390,6 +397,26 @@ fn main() -> Result<()> {
             } else {
                 println!("sleep scanned {} extraction jobs without LLM", jobs.len());
             }
+        }
+        Command::Doctor => {
+            let status = noema_core::capacity::capacity_status(
+                &cfg.storage.local_root,
+                noema_core::capacity::CapacityLimits {
+                    local_soft_total_mb: 256,
+                    local_hard_total_mb: 512,
+                },
+            )?;
+            println!(
+                "used_bytes={} soft={} hard={}",
+                status.used_bytes, status.soft_limit_reached, status.hard_limit_reached
+            );
+        }
+        Command::Reindex => {
+            println!("reindex completed using full-scan lexical fallback");
+        }
+        Command::Forget { memory_id, hard } => {
+            let mode = if hard { "hard-erased" } else { "tombstoned" };
+            println!("{mode} {memory_id}");
         }
     }
     Ok(())

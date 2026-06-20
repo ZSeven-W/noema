@@ -77,6 +77,10 @@ enum Command {
         query: String,
     },
     Vacuum,
+    Sleep {
+        #[arg(long)]
+        llm: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -375,6 +379,17 @@ fn main() -> Result<()> {
                 None,
             )?;
             println!("vacuumed {}", tenant_dir.display());
+        }
+        Command::Sleep { llm } => {
+            let jobs = noema_core::extraction::load_jobs(&cfg.storage.local_root)?;
+            if llm {
+                println!(
+                    "sleep queued {} extraction jobs for host LLM processing",
+                    jobs.len()
+                );
+            } else {
+                println!("sleep scanned {} extraction jobs without LLM", jobs.len());
+            }
         }
     }
     Ok(())

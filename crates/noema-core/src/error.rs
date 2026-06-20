@@ -6,6 +6,8 @@ pub enum NoemaError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("jwt: {0}")]
+    Jwt(#[from] jsonwebtoken::errors::Error),
     #[error("toml decode: {0}")]
     TomlDe(#[from] toml::de::Error),
     #[error("toml encode: {0}")]

@@ -14,9 +14,7 @@ pub fn decode<T: DeserializeOwned>(text: &str) -> Result<(T, String)> {
         ));
     };
     let Some((head, body)) = rest.split_once("\n---\n") else {
-        return Err(NoemaError::InvalidRecord(
-            "unterminated frontmatter".into(),
-        ));
+        return Err(NoemaError::InvalidRecord("unterminated frontmatter".into()));
     };
     let frontmatter = serde_json::from_str(head)?;
     Ok((frontmatter, body.trim_end_matches('\n').to_string()))

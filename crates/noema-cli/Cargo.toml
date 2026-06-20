@@ -15,3 +15,7 @@ uuid.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
+
+[[test]]
+name = "cli_smoke"
+path = "../../tests/cli_smoke.rs"

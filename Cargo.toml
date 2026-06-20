@@ -4,6 +4,7 @@ members = [
   "crates/noema-core",
   "crates/noema-cli",
   "crates/noema-mcp",
+  "crates/noema-server",
 ]
 
 [workspace.package]
@@ -16,6 +17,7 @@ anyhow = "1"
 assert_cmd = "2"
 async-trait = "0.1"
 aws-sdk-s3 = "1"
+axum = "0.7"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 fs4 = "0.8"

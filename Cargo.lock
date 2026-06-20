@@ -1613,6 +1613,7 @@ dependencies = [
  "clap",
  "noema-core",
  "predicates",
+ "serde_json",
  "tempfile",
  "uuid",
 ]

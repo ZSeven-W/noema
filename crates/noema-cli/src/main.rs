@@ -76,6 +76,7 @@ enum Command {
         #[arg(long)]
         query: String,
     },
+    Vacuum,
 }
 
 fn main() -> Result<()> {
@@ -373,6 +374,22 @@ fn main() -> Result<()> {
             {
                 println!("{}", scored.explanation.join("\n"));
             }
+        }
+        Command::Vacuum => {
+            let tenant_dir = paths.tenant_dir(&tenant);
+            let _tenant_lock = FileLock::exclusive(tenant_dir.join("tenant.lock"))?;
+            noema_core::vacuum::compact_hippocampus(&tenant_dir)?;
+            append_audit_event(
+                &tenant_dir,
+                &tenant,
+                &user,
+                Scope::User,
+                AuditAction::VacuumCompacted,
+                None,
+                None,
+                None,
+            )?;
+            println!("vacuumed {}", tenant_dir.display());
         }
     }
     Ok(())

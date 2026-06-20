@@ -425,7 +425,25 @@ fn main() -> Result<()> {
             );
         }
         Command::Reindex => {
-            println!("reindex completed using full-scan lexical fallback");
+            let mut index = noema_core::index::LexicalIndex::default();
+            for memory in load_recall_memories(&paths, &tenant, &user, None)? {
+                index.add(noema_core::index::IndexDocument {
+                    id: memory.id,
+                    text: memory.body,
+                    tags: memory.tags,
+                    entities: memory.entities,
+                });
+            }
+            let index_dir = paths.tenant_dir(&tenant).join("indexes");
+            std::fs::create_dir_all(&index_dir)?;
+            std::fs::write(
+                index_dir.join("lexical.json"),
+                serde_json::to_vec_pretty(&index)?,
+            )?;
+            println!(
+                "reindex completed {}",
+                index_dir.join("lexical.json").display()
+            );
         }
         Command::Forget { memory_id, hard } => {
             let mode = if hard { "hard-erased" } else { "tombstoned" };

@@ -9,6 +9,7 @@ repository.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 noema-core = { path = "../noema-core" }
+serde_json.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

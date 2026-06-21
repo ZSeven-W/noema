@@ -1,70 +1,18 @@
-use anyhow::Result;
-use serde_json::json;
-use std::io::{self, Read};
+use std::sync::Arc;
 
-fn main() -> Result<()> {
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input)?;
-    let request: serde_json::Value = serde_json::from_str(input.trim())?;
-    let id = request.get("id").cloned().unwrap_or(json!(null));
-    let method = request
-        .get("method")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
+use noema_core::api::NoemaEngine;
+use noema_core::config::NoemaConfig;
+use noema_core::ids::UserId;
+use noema_mcp::{personal_principal, NoemaTools};
+use rmcp::{transport::stdio, ServiceExt};
 
-    let result = match method {
-        "tools/list" => tools_list(),
-        "tools/call" => tools_call(request.get("params").cloned().unwrap_or(json!({}))),
-        _ => json!({"error": format!("unsupported method: {method}")}),
-    };
-
-    println!("{}", json!({"jsonrpc":"2.0","id":id,"result":result}));
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cfg = NoemaConfig::load_or_default()?;
+    let engine = Arc::new(NoemaEngine::from_config(&cfg)?);
+    engine.init_personal(&UserId::new(&cfg.tenant.default_user_id))?;
+    let tools = NoemaTools::new(engine, personal_principal(&cfg));
+    let service = tools.serve(stdio()).await?;
+    service.waiting().await?;
     Ok(())
-}
-
-fn tools_list() -> serde_json::Value {
-    json!({
-        "tools": [
-            {"name": "noema_recall", "readOnlyHint": true},
-            {"name": "noema_submit_candidate", "readOnlyHint": false},
-            {"name": "noema_remember", "readOnlyHint": false},
-            {"name": "noema_review_list", "readOnlyHint": true},
-            {"name": "noema_review_decide", "readOnlyHint": false},
-            {"name": "noema_search", "readOnlyHint": true},
-            {"name": "noema_explain", "readOnlyHint": true},
-            {"name": "noema_policy_get", "readOnlyHint": true},
-            {"name": "noema_policy_set", "readOnlyHint": false},
-            {"name": "noema_status", "readOnlyHint": true}
-        ]
-    })
-}
-
-fn tools_call(params: serde_json::Value) -> serde_json::Value {
-    let name = params
-        .get("name")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-    match name {
-        "noema_status" => json!({"tenant":"personal","mode":"local","ok":true}),
-        "noema_policy_get" => json!({"write":"review","auto_accept_max_sensitivity":"internal"}),
-        "noema_recall" | "noema_search" => {
-            json!({"query": arguments.get("query").cloned().unwrap_or(json!("")), "memories": []})
-        }
-        "noema_explain" => {
-            json!({"memory_id": arguments.get("memory_id").cloned().unwrap_or(json!("")), "explanation": []})
-        }
-        // Mutating handlers are not yet wired to noema-core. Return an explicit
-        // "not implemented" instead of falsely reporting success / "audited":true,
-        // which would let a caller believe a policy change or review decision was
-        // persisted and audited when nothing happened.
-        "noema_policy_set"
-        | "noema_submit_candidate"
-        | "noema_remember"
-        | "noema_review_decide" => {
-            json!({"ok": false, "error": format!("not implemented: '{name}' does not yet persist through noema-core; use the noema CLI")})
-        }
-        "noema_review_list" => json!({"pending": []}),
-        _ => json!({"error": format!("unsupported tool: {name}")}),
-    }
 }

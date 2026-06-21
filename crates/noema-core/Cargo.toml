@@ -6,13 +6,15 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+default = ["s3-sdk"]
 # Compiles the large LOCOMO/recall benchmark harness (src/benchmark.rs). Off by
 # default so library consumers do not pay for it; the noema CLI enables it.
 benchmark = []
+s3-sdk = ["dep:aws-sdk-s3"]
 
 [dependencies]
 async-trait.workspace = true
-aws-sdk-s3.workspace = true
+aws-sdk-s3 = { workspace = true, optional = true }
 base64.workspace = true
 fs4.workspace = true
 hmac.workspace = true

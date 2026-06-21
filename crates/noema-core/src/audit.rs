@@ -18,6 +18,7 @@ pub enum AuditAction {
     MemoryWritten,
     MemoryTombstoned,
     VacuumCompacted,
+    PolicyChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

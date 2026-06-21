@@ -14,7 +14,7 @@ use crate::hippocampus::{
 };
 use crate::ids::{CandidateId, MemoryId, ProjectId, TenantId, UserId};
 use crate::lock::FileLock;
-use crate::memory::{MemoryRecord, RecallMode, Scope, Visibility};
+use crate::memory::{MemoryRecord, MemoryStatus, RecallMode, Scope, Visibility};
 use crate::memorypack::{MemoryPack, MemoryPackItem};
 use crate::paths::NoemaPaths;
 use crate::project::project_id_from_path;
@@ -261,6 +261,116 @@ impl NoemaEngine {
                 })
             }
         }
+    }
+
+    /// Finds the on-disk path for a memory by ID, checking user cortex then all
+    /// project cortex directories under the tenant.
+    fn find_memory_path(&self, tenant: &TenantId, user: &UserId, id: &MemoryId) -> Option<PathBuf> {
+        let user_path = self
+            .paths
+            .user_cortex_dir(tenant, user)
+            .join(format!("{id}.md"));
+        if user_path.exists() {
+            return Some(user_path);
+        }
+        let projects = self.paths.tenant_dir(tenant).join("projects");
+        if let Ok(entries) = std::fs::read_dir(&projects) {
+            for entry in entries.flatten() {
+                let candidate = entry.path().join("cortex").join(format!("{id}.md"));
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn forget(&self, request: ForgetRequest) -> Result<ForgetOutcome> {
+        let tenant = request.principal.tenant_id.clone();
+        let user = request.principal.user_id.clone();
+        let tenant_dir = self.paths.tenant_dir(&tenant);
+        let _lock = FileLock::exclusive(tenant_dir.join("tenant.lock"))?;
+        let id = MemoryId::new(&request.memory_id);
+        let path = self
+            .find_memory_path(&tenant, &user, &id)
+            .ok_or_else(|| NoemaError::NotFound(format!("memory not found: {id}")))?;
+        let mut memory = read_memory(&path)?;
+        if request.hard {
+            std::fs::remove_file(&path)?;
+        } else {
+            memory.status = MemoryStatus::Tombstoned;
+            memory.recall_policy.mode = RecallMode::Never;
+            write_memory(&path, &memory)?;
+        }
+        let mode = if request.hard {
+            "hard-erased"
+        } else {
+            "tombstoned"
+        };
+        self.audit(
+            &tenant,
+            &user,
+            memory.scope,
+            AuditAction::MemoryTombstoned,
+            None,
+            Some(id.clone()),
+            Some(mode.to_string()),
+        )?;
+        Ok(ForgetOutcome {
+            memory_id: id.to_string(),
+            mode: mode.to_string(),
+        })
+    }
+
+    pub fn policy_get(&self, _principal: &Principal) -> Result<PolicyView> {
+        Ok(PolicyView {
+            write: self.config.policy.write,
+            auto_accept_max_sensitivity: self.config.sensitive.auto_accept_max_sensitivity,
+            external_llm_max_sensitivity: self.config.sensitive.external_llm_max_sensitivity,
+        })
+    }
+
+    pub fn policy_set(&self, request: PolicySetRequest) -> Result<PolicyView> {
+        // Enterprise gating: only reviewer/admin roles may change policy.
+        if self.config.tenant.mode == crate::config::TenantMode::Enterprise {
+            use crate::policy::{AclDecision, EnterprisePolicy};
+            if EnterprisePolicy::default().can_write_org_memory(&request.principal.roles)
+                == AclDecision::Deny
+            {
+                return Err(NoemaError::PolicyDenied(
+                    "policy change requires reviewer role".into(),
+                ));
+            }
+        }
+        // Clone the config, apply the requested changes, and persist to disk.
+        // Note: self.config (in-memory) is not mutated; engine takes &self.
+        let mut config = self.config.clone();
+        if let Some(write) = request.write {
+            config.policy.write = write;
+        }
+        let tenant_dir = self.paths.tenant_dir(&request.principal.tenant_id);
+        let _lock = FileLock::exclusive(tenant_dir.join("tenant.lock"))?;
+        std::fs::write(self.root.join("config.toml"), config.to_toml()?)?;
+        self.audit(
+            &request.principal.tenant_id,
+            &request.principal.user_id,
+            Scope::User,
+            AuditAction::PolicyChanged,
+            None,
+            None,
+            None,
+        )?;
+        self.policy_get(&request.principal)
+    }
+
+    pub fn status(&self, principal: &Principal) -> Result<StatusView> {
+        Ok(StatusView {
+            tenant: principal.tenant_id.to_string(),
+            user: principal.user_id.to_string(),
+            mode: format!("{:?}", self.config.tenant.mode).to_lowercase(),
+            write_policy: self.config.policy.write,
+            ok: true,
+        })
     }
 
     fn hip_dir(&self, tenant: &TenantId) -> PathBuf {
@@ -614,6 +724,73 @@ mod tests {
             engine.config().tenant.mode,
             crate::config::TenantMode::Personal
         );
+    }
+
+    #[test]
+    fn forget_tombstones_and_audits() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = NoemaEngine::new(dir.path()).unwrap();
+        let principal = Principal::personal("kay", "noema-cli");
+        engine.init_personal(&UserId::new("kay")).unwrap();
+        engine
+            .submit_candidate(RememberRequest {
+                principal: principal.clone(),
+                text: "x".into(),
+                scope: crate::memory::Scope::User,
+                project_path: None,
+                kind: crate::memory::MemoryKind::Preference,
+                sensitivity: crate::sensitivity::SensitivityLevel::Internal,
+                tags: vec![],
+                entities: vec![],
+                confidence: 1.0,
+                importance: 0.5,
+            })
+            .unwrap();
+        let pending = engine.review_list(&principal).unwrap();
+        let cid = pending
+            .first()
+            .expect("candidate not queued — check default WritePolicy")
+            .id
+            .to_string();
+        let id = match engine
+            .review_decide(ReviewDecisionRequest {
+                principal: principal.clone(),
+                candidate_id: cid,
+                action: ReviewAction::Accept,
+            })
+            .unwrap()
+        {
+            ReviewOutcome::Accepted { memory_id } => memory_id,
+            _ => panic!("expected Accepted"),
+        };
+
+        let out = engine
+            .forget(ForgetRequest {
+                principal: principal.clone(),
+                memory_id: id.clone(),
+                hard: false,
+            })
+            .unwrap();
+        assert_eq!(out.mode, "tombstoned");
+        // Tombstoned memory must not appear in search results.
+        let hits = engine
+            .search(SearchRequest {
+                principal,
+                query: "x".into(),
+                cwd: None,
+            })
+            .unwrap();
+        assert!(hits.iter().all(|h| h.id != id));
+    }
+
+    #[test]
+    fn status_reports_personal_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = NoemaEngine::new(dir.path()).unwrap();
+        let principal = Principal::personal("kay", "noema-cli");
+        let s = engine.status(&principal).unwrap();
+        assert_eq!(s.tenant, "personal");
+        assert!(s.ok);
     }
 
     #[test]

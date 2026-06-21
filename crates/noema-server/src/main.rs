@@ -113,6 +113,12 @@ async fn main() -> anyhow::Result<()> {
             .into_bytes(),
     );
 
+    if secret.len() < 32 {
+        anyhow::bail!(
+            "NOEMA_HMAC_SECRET must be set and at least 32 bytes; refusing to start the authenticated MCP server without a valid signing secret"
+        );
+    }
+
     // Fallback principal for non-HTTP transports; never reached on the HTTP
     // MCP path because the auth middleware enforces a valid token first.
     let anon = personal_principal(&cfg);

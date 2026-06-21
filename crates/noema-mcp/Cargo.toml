@@ -5,16 +5,27 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "noema-mcp"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 noema-core = { path = "../noema-core" }
+rmcp = { version = "1", features = ["server", "macros", "transport-io"] }
 
 [dev-dependencies]
 assert_cmd.workspace = true
 predicates.workspace = true
+tempfile.workspace = true
+rmcp = { version = "1", features = ["client", "transport-io"] }
 
 [[test]]
-name = "mcp_contract"
-path = "../../tests/mcp_contract.rs"
+name = "stdio_contract"
+path = "tests/stdio_contract.rs"

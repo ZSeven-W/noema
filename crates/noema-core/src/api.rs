@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::config::NoemaConfig;
@@ -26,6 +27,22 @@ pub struct RecallRequest {
     pub cwd: Option<PathBuf>,
     pub budget_tokens: usize,
     pub host: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfiledRecall {
+    pub pack: MemoryPack,
+    pub timings: RecallTimings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecallTimings {
+    pub loaded_memories: usize,
+    pub scored_memories: usize,
+    pub load_memories_us: f64,
+    pub score_memories_us: f64,
+    pub build_pack_us: f64,
+    pub total_us: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -96,22 +113,43 @@ impl NoemaEngine {
     }
 
     pub fn recall(&self, request: RecallRequest) -> Result<MemoryPack> {
+        Ok(self.recall_profiled(request)?.pack)
+    }
+
+    pub fn recall_profiled(&self, request: RecallRequest) -> Result<ProfiledRecall> {
+        let total_start = Instant::now();
         let tenant = request.principal.tenant_id.clone();
         let user = request.principal.user_id.clone();
         let project = request.cwd.as_deref().map(project_id_from_path);
+
+        let load_start = Instant::now();
         let memories = load_recall_memories(&self.paths, &tenant, &user, project.as_ref())?;
+        let load_memories_us = elapsed_us(load_start);
+
+        let score_start = Instant::now();
         let scored = recall(
             &request.query,
             &request.principal,
             project.as_ref(),
             &memories,
         );
+        let score_memories_us = elapsed_us(score_start);
+        let scored_memories = scored.len();
+
+        let build_start = Instant::now();
         let mut pack = MemoryPack::empty(tenant);
+        let mut used_tokens = 0usize;
         for score in scored.into_iter().take(8) {
             if let Some(memory) = memories
                 .iter()
                 .find(|memory| memory.id.as_str() == score.id)
             {
+                // Rough token estimate; stop once the budget would be exceeded.
+                let item_tokens = memory.body.chars().count() / 4 + 1;
+                if used_tokens + item_tokens > request.budget_tokens {
+                    break;
+                }
+                used_tokens += item_tokens;
                 pack.memories.push(MemoryPackItem {
                     id: memory.id.clone(),
                     scope: format!("{:?}", memory.scope).to_lowercase(),
@@ -122,8 +160,24 @@ impl NoemaEngine {
                 });
             }
         }
-        Ok(pack)
+        let build_pack_us = elapsed_us(build_start);
+        let total_us = elapsed_us(total_start);
+        Ok(ProfiledRecall {
+            pack,
+            timings: RecallTimings {
+                loaded_memories: memories.len(),
+                scored_memories,
+                load_memories_us,
+                score_memories_us,
+                build_pack_us,
+                total_us,
+            },
+        })
     }
+}
+
+fn elapsed_us(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1_000_000.0
 }
 
 fn memory_from_candidate(tenant: &TenantId, user: &UserId, candidate: &Candidate) -> MemoryRecord {
@@ -231,5 +285,84 @@ mod tests {
 
         assert_eq!(pack.tenant_id, TenantId::new("personal"));
         assert!(pack.to_markdown().contains("Relevant Memories"));
+    }
+
+    #[test]
+    fn engine_recall_enforces_budget_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = NoemaEngine::new(dir.path()).unwrap();
+        let principal = Principal::personal("kay", "zode");
+        engine.init_personal(&UserId::new("kay")).unwrap();
+        engine
+            .remember_text(RememberTextRequest {
+                principal: principal.clone(),
+                text: "Prefer Rust for Noema.".to_string(),
+                scope: crate::memory::Scope::User,
+                project_path: None,
+                kind: crate::memory::MemoryKind::Preference,
+                sensitivity: crate::sensitivity::SensitivityLevel::Internal,
+                tags: vec!["rust".to_string()],
+                entities: vec!["Noema".to_string()],
+            })
+            .unwrap();
+
+        let tiny = engine
+            .recall(RecallRequest {
+                principal: principal.clone(),
+                query: "rust memory".to_string(),
+                cwd: None,
+                budget_tokens: 1,
+                host: "zode".to_string(),
+            })
+            .unwrap();
+        assert_eq!(tiny.memories.len(), 0);
+
+        let generous = engine
+            .recall(RecallRequest {
+                principal,
+                query: "rust memory".to_string(),
+                cwd: None,
+                budget_tokens: 1200,
+                host: "zode".to_string(),
+            })
+            .unwrap();
+        assert_eq!(generous.memories.len(), 1);
+    }
+
+    #[test]
+    fn engine_profiled_recall_reports_phase_timings() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = NoemaEngine::new(dir.path()).unwrap();
+        let principal = Principal::personal("kay", "zode");
+        engine.init_personal(&UserId::new("kay")).unwrap();
+        engine
+            .remember_text(RememberTextRequest {
+                principal: principal.clone(),
+                text: "Prefer Rust for profiled Noema recall.".to_string(),
+                scope: crate::memory::Scope::User,
+                project_path: None,
+                kind: crate::memory::MemoryKind::Preference,
+                sensitivity: crate::sensitivity::SensitivityLevel::Internal,
+                tags: vec!["rust".to_string()],
+                entities: vec!["Noema".to_string()],
+            })
+            .unwrap();
+
+        let profiled = engine
+            .recall_profiled(RecallRequest {
+                principal,
+                query: "rust noema".to_string(),
+                cwd: None,
+                budget_tokens: 1200,
+                host: "zode".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(profiled.pack.memories.len(), 1);
+        assert_eq!(profiled.timings.loaded_memories, 1);
+        assert_eq!(profiled.timings.scored_memories, 1);
+        assert!(profiled.timings.load_memories_us > 0.0);
+        assert!(profiled.timings.score_memories_us > 0.0);
+        assert!(profiled.timings.build_pack_us > 0.0);
     }
 }

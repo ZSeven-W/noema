@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::error::Result;
 use crate::hippocampus::{load_candidates, load_decisions, pending_candidates, ReviewDecision};
 use crate::jsonl::append_jsonl;
-use crate::lock::atomic_write_locked;
+use crate::lock::{atomic_write, atomic_write_locked};
 
 pub fn compact_hippocampus(tenant_dir: &Path) -> Result<()> {
     let hip = tenant_dir.join("hippocampus");
@@ -24,9 +24,10 @@ pub fn compact_hippocampus(tenant_dir: &Path) -> Result<()> {
 
     let snapshot = hip.join("snapshots").join("pending-latest.jsonl");
     let archive = hip.join("archive").join("compacted-latest.jsonl");
-    for candidate in &pending {
-        append_jsonl(&snapshot, candidate)?;
-    }
+    // Overwrite the snapshot with the current pending set; "-latest" is a
+    // point-in-time view, not an append log, so it must not grow unbounded.
+    atomic_write(&snapshot, &jsonl_bytes(&pending)?)?;
+    // Archive terminal candidates and the full decision history (append-only).
     for candidate in candidates
         .iter()
         .filter(|candidate| terminal.contains(&candidate.id))
@@ -36,12 +37,24 @@ pub fn compact_hippocampus(tenant_dir: &Path) -> Result<()> {
     for decision in &decisions_loaded {
         append_jsonl(&archive, decision)?;
     }
-    atomic_write_locked(&hip.join("inbox.lock"), &inbox, b"")?;
+    // Replace the inbox with only the survivors in a SINGLE atomic write. The
+    // previous truncate-then-re-append left a crash window in which the inbox
+    // was empty and every pending candidate was lost. Edits are already baked
+    // into `pending`, so the decisions log can be cleared afterwards; a crash
+    // between the two writes is harmless (stale decisions reference candidates
+    // that are no longer in the inbox, or re-apply an idempotent edit).
+    atomic_write_locked(&hip.join("inbox.lock"), &inbox, &jsonl_bytes(&pending)?)?;
     atomic_write_locked(&hip.join("decisions.lock"), &decisions, b"")?;
-    for candidate in &pending {
-        append_jsonl(&inbox, candidate)?;
-    }
     Ok(())
+}
+
+fn jsonl_bytes<T: serde::Serialize>(rows: &[T]) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    for row in rows {
+        buf.extend_from_slice(&serde_json::to_vec(row)?);
+        buf.push(b'\n');
+    }
+    Ok(buf)
 }
 
 #[cfg(test)]

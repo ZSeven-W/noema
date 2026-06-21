@@ -1,7 +1,7 @@
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{NoemaError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrincipalClaims {
@@ -12,9 +12,15 @@ pub struct PrincipalClaims {
     pub host: String,
     pub clearance: String,
     pub exp: u64,
+    pub iss: String,
+    pub aud: String,
+    pub sub: String,
 }
 
 pub fn sign_principal(claims: &PrincipalClaims, secret: &[u8]) -> Result<String> {
+    if secret.len() < 32 {
+        return Err(NoemaError::PolicyDenied("hmac secret too short".into()));
+    }
     Ok(encode(
         &Header::default(),
         claims,
@@ -23,11 +29,14 @@ pub fn sign_principal(claims: &PrincipalClaims, secret: &[u8]) -> Result<String>
 }
 
 pub fn verify_principal(token: &str, secret: &[u8]) -> Result<PrincipalClaims> {
-    let data = decode::<PrincipalClaims>(
-        token,
-        &DecodingKey::from_secret(secret),
-        &Validation::default(),
-    )?;
+    if secret.len() < 32 {
+        return Err(NoemaError::PolicyDenied("hmac secret too short".into()));
+    }
+    let mut v = Validation::new(Algorithm::HS256);
+    v.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+    v.set_issuer(&["noema"]);
+    v.set_audience(&["noema"]);
+    let data = decode::<PrincipalClaims>(token, &DecodingKey::from_secret(secret), &v)?;
     Ok(data.claims)
 }
 
@@ -35,9 +44,10 @@ pub fn verify_principal(token: &str, secret: &[u8]) -> Result<PrincipalClaims> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn signed_principal_roundtrips() {
-        let claims = PrincipalClaims {
+    const SECRET: &[u8] = b"test-secret-test-secret-test-secret!!";
+
+    fn sample_claims() -> PrincipalClaims {
+        PrincipalClaims {
             tenant_id: "acme".to_string(),
             user_id: "kay".to_string(),
             groups: vec!["eng".to_string()],
@@ -45,10 +55,32 @@ mod tests {
             host: "noema-server".to_string(),
             clearance: "confidential".to_string(),
             exp: 4_102_444_800,
-        };
-        let token = sign_principal(&claims, b"test-secret").unwrap();
-        let verified = verify_principal(&token, b"test-secret").unwrap();
+            iss: "noema".into(),
+            aud: "noema".into(),
+            sub: "kay".into(),
+        }
+    }
+
+    #[test]
+    fn signed_principal_roundtrips() {
+        let claims = sample_claims();
+        let token = sign_principal(&claims, SECRET).unwrap();
+        let verified = verify_principal(&token, SECRET).unwrap();
         assert_eq!(verified.tenant_id, "acme");
         assert_eq!(verified.roles, vec!["reviewer"]);
+    }
+
+    #[test]
+    fn verify_rejects_wrong_audience() {
+        let mut claims = sample_claims();
+        claims.aud = "evil".into();
+        let token = sign_principal(&claims, SECRET).unwrap();
+        assert!(verify_principal(&token, SECRET).is_err());
+    }
+
+    #[test]
+    fn sign_rejects_short_secret() {
+        let claims = sample_claims();
+        assert!(sign_principal(&claims, b"short").is_err());
     }
 }

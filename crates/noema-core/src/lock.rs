@@ -54,6 +54,13 @@ pub fn atomic_write_locked(lock_path: &Path, path: &Path, bytes: &[u8]) -> Resul
         file.sync_all()?;
     }
     std::fs::rename(tmp, path)?;
+    // fsync the parent directory so the rename itself survives a crash; without
+    // this the directory entry can revert to its pre-rename state after power loss.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 

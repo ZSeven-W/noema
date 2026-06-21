@@ -48,18 +48,23 @@ fn tools_call(params: serde_json::Value) -> serde_json::Value {
     match name {
         "noema_status" => json!({"tenant":"personal","mode":"local","ok":true}),
         "noema_policy_get" => json!({"write":"review","auto_accept_max_sensitivity":"internal"}),
-        "noema_policy_set" => json!({"ok": true, "audited": true}),
         "noema_recall" | "noema_search" => {
             json!({"query": arguments.get("query").cloned().unwrap_or(json!("")), "memories": []})
         }
         "noema_explain" => {
             json!({"memory_id": arguments.get("memory_id").cloned().unwrap_or(json!("")), "explanation": []})
         }
-        "noema_submit_candidate" | "noema_remember" => {
-            json!({"ok": true, "route": "pending_review"})
+        // Mutating handlers are not yet wired to noema-core. Return an explicit
+        // "not implemented" instead of falsely reporting success / "audited":true,
+        // which would let a caller believe a policy change or review decision was
+        // persisted and audited when nothing happened.
+        "noema_policy_set"
+        | "noema_submit_candidate"
+        | "noema_remember"
+        | "noema_review_decide" => {
+            json!({"ok": false, "error": format!("not implemented: '{name}' does not yet persist through noema-core; use the noema CLI")})
         }
         "noema_review_list" => json!({"pending": []}),
-        "noema_review_decide" => json!({"ok": true, "audited": true}),
         _ => json!({"error": format!("unsupported tool: {name}")}),
     }
 }

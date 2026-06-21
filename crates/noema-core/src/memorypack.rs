@@ -36,7 +36,10 @@ impl MemoryPack {
                     "- [{}/{}][{}][withheld_by_policy]\n",
                     item.scope, item.kind, item.id
                 ));
-            } else if let Some(text) = &item.text {
+            } else if let Some(raw) = &item.text {
+                // Strip newlines so a memory body cannot forge markdown structure
+                // or inject extra lines into the prompt.
+                let text = raw.replace(['\n', '\r'], " ");
                 out.push_str(&format!(
                     "- [{}/{}][{}] {}\n",
                     item.scope, item.kind, item.id, text
@@ -45,8 +48,9 @@ impl MemoryPack {
         }
         out.push_str("\n## Subconscious Hints\n");
         for hint in &self.subconscious_hints {
+            let hint = hint.replace(['\n', '\r'], " ");
             out.push_str("- ");
-            out.push_str(hint);
+            out.push_str(&hint);
             out.push('\n');
         }
         out
@@ -75,5 +79,31 @@ mod tests {
         let rendered = pack.to_markdown();
         assert!(rendered.contains("[withheld_by_policy]"));
         assert!(!rendered.contains("raw incident"));
+    }
+
+    #[test]
+    fn memorypack_sanitizes_newlines_in_body() {
+        let pack = MemoryPack {
+            tenant_id: TenantId::new("personal"),
+            memories: vec![MemoryPackItem {
+                id: MemoryId::new("mem_inject"),
+                scope: "user".to_string(),
+                kind: "preference".to_string(),
+                text: Some("line1\n## Injected".to_string()),
+                withheld_by_policy: false,
+                score: 0.5,
+            }],
+            subconscious_hints: Vec::new(),
+        };
+
+        let rendered = pack.to_markdown();
+        let item_line = rendered
+            .lines()
+            .find(|line| line.contains("mem_inject"))
+            .expect("item line present");
+        assert!(item_line.contains("line1 ## Injected"));
+        assert!(!item_line.contains('\n'));
+        // The forged header must not start its own markdown line.
+        assert!(!rendered.contains("\n## Injected"));
     }
 }

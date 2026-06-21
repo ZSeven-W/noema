@@ -1,11 +1,17 @@
 use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
 
+// NOTE: this server is an enterprise *scaffold*. The `/status` route does NOT
+// authenticate callers: `noema_core::identity::verify_principal` exists but is
+// not yet wired into request handling, and no handler enforces ACL/policy.
+// `auth_enforced`/`acl_enforced` are reported as `false` so the payload does not
+// advertise a trust boundary that is not actually enforced at runtime.
 pub fn status_payload() -> Value {
     json!({
         "service": "noema-server",
         "trust_boundary": "signed-principal",
-        "enterprise_acl": true
+        "auth_enforced": false,
+        "acl_enforced": false
     })
 }
 

@@ -37,11 +37,16 @@ fn dir_size(path: &std::path::Path) -> Result<u64> {
     let mut total = 0;
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
-        let meta = entry.metadata()?;
-        if meta.is_dir() {
+        // `file_type` does not follow symlinks, so symlink loops cannot cause
+        // infinite recursion. Skip symlinks entirely.
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             total += dir_size(&entry.path())?;
-        } else {
-            total += meta.len();
+        } else if file_type.is_file() {
+            total += entry.metadata()?.len();
         }
     }
     Ok(total)
@@ -65,5 +70,12 @@ mod tests {
         assert_eq!(status.local_soft_total_mb, 1);
         assert_eq!(status.local_hard_total_mb, 2);
         assert!(!status.hard_limit_reached);
+    }
+
+    #[test]
+    fn dir_size_counts_regular_file_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mem.md"), b"hello world").unwrap();
+        assert_eq!(dir_size(dir.path()).unwrap(), 11);
     }
 }

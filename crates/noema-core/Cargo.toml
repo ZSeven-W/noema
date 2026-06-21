@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Compiles the large LOCOMO/recall benchmark harness (src/benchmark.rs). Off by
+# default so library consumers do not pay for it; the noema CLI enables it.
+benchmark = []
+
 [dependencies]
 async-trait.workspace = true
 aws-sdk-s3.workspace = true
@@ -33,3 +38,8 @@ path = "../../tests/s3_fake.rs"
 [[test]]
 name = "enterprise_policy"
 path = "../../tests/enterprise_policy.rs"
+
+[[test]]
+name = "benchmark"
+path = "../../tests/benchmark.rs"
+required-features = ["benchmark"]

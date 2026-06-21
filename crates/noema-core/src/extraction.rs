@@ -49,8 +49,11 @@ pub fn append_job(root: &std::path::Path, job: &ExtractionJob) -> Result<()> {
     append_jsonl_locked(&path.with_extension("lock"), &path, job)
 }
 
-pub fn load_jobs(root: &std::path::Path) -> Result<Vec<ExtractionJob>> {
-    let path = root.join("tenants/personal/extraction/jobs.jsonl");
+pub fn load_jobs(root: &std::path::Path, tenant: &TenantId) -> Result<Vec<ExtractionJob>> {
+    let path = root
+        .join("tenants")
+        .join(tenant.as_str())
+        .join("extraction/jobs.jsonl");
     read_jsonl(&path)
 }
 
@@ -68,7 +71,7 @@ mod tests {
             TranscriptRange { start: 10, end: 20 },
         );
         append_job(dir.path(), &job).unwrap();
-        let jobs = load_jobs(dir.path()).unwrap();
+        let jobs = load_jobs(dir.path(), &TenantId::new("personal")).unwrap();
         assert_eq!(jobs.len(), 1);
         let encoded = serde_json::to_string(&jobs[0]).unwrap();
         assert!(!encoded.contains("raw transcript"));

@@ -28,13 +28,27 @@ pub fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
         return Ok(Vec::new());
     }
     let file = OpenOptions::new().read(true).open(path)?;
+    let lines: Vec<String> = BufReader::new(file)
+        .lines()
+        .collect::<std::io::Result<_>>()?;
     let mut out = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let line = line?;
+    for (index, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        out.push(serde_json::from_str(&line)?);
+        match serde_json::from_str(line) {
+            Ok(value) => out.push(value),
+            Err(error) => {
+                // Tolerate a torn final line: a crash mid-append can leave a
+                // partial JSON record with no trailing newline. Only the last
+                // non-empty line may be skipped; corruption before it is fatal.
+                let rest_is_blank = lines[index + 1..].iter().all(|l| l.trim().is_empty());
+                if rest_is_blank {
+                    break;
+                }
+                return Err(error.into());
+            }
+        }
     }
     Ok(out)
 }
@@ -60,6 +74,32 @@ mod tests {
             rows,
             vec![Row { value: "a".into() }, Row { value: "b".into() }]
         );
+    }
+
+    #[test]
+    fn read_jsonl_tolerates_torn_final_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rows.jsonl");
+        append_jsonl(&path, &Row { value: "a".into() }).unwrap();
+        // Simulate a crash that left a partial record with no terminating newline.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"value\":\"b").unwrap();
+        let rows: Vec<Row> = read_jsonl(&path).unwrap();
+        assert_eq!(rows, vec![Row { value: "a".into() }]);
+    }
+
+    #[test]
+    fn read_jsonl_rejects_corruption_before_final_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rows.jsonl");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"not json\n{\"value\":\"b\"}\n").unwrap();
+        let result: Result<Vec<Row>> = read_jsonl(&path);
+        assert!(result.is_err());
     }
 
     #[test]

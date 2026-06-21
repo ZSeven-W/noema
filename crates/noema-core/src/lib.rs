@@ -1,5 +1,14 @@
 pub mod api;
 pub mod audit;
+// The LOCOMO/recall benchmark harness is a large, optional module. Gate it behind
+// a feature so library consumers (e.g. zode) do not compile it; the noema CLI
+// enables the feature because it owns the `bench` subcommand.
+#[cfg(feature = "benchmark")]
+// The harness carries prompt-builder helpers that are not all wired into the
+// active pipeline yet; allow dead_code here so the experimental bench module
+// does not block the `-D warnings` clippy gate.
+#[allow(dead_code)]
+pub mod benchmark;
 pub mod capacity;
 pub mod config;
 pub mod crypto;

@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use noema_core::audit::{append_audit, AuditAction, AuditEvent};
+use noema_core::benchmark::LocomoMemorySource;
 use noema_core::config::{NoemaConfig, TenantMode};
 use noema_core::hippocampus::{
     append_candidate, append_decision, load_candidates, load_decisions, pending_candidates,
@@ -8,13 +9,14 @@ use noema_core::hippocampus::{
 };
 use noema_core::ids::{CandidateId, MemoryId, ProjectId, TenantId, UserId};
 use noema_core::lock::FileLock;
-use noema_core::memory::{MemoryKind, MemoryRecord, RecallMode, Scope, Visibility};
+use noema_core::memory::{MemoryKind, MemoryRecord, MemoryStatus, RecallMode, Scope, Visibility};
 use noema_core::paths::NoemaPaths;
 use noema_core::project::project_id_from_path;
 use noema_core::recall::{explain_memory, recall};
 use noema_core::review::{route_candidate, CandidateRoute};
 use noema_core::sensitivity::{Principal, SensitivityLevel};
 use noema_core::store::{read_memory, write_memory};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -26,6 +28,7 @@ struct Cli {
     command: Command,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     Init,
@@ -83,6 +86,64 @@ enum Command {
     },
     Doctor,
     Reindex,
+    Bench {
+        #[arg(long, default_value_t = 1000)]
+        memories: usize,
+        #[arg(long, default_value_t = 8)]
+        queries: usize,
+        #[arg(long, default_value_t = 50)]
+        iterations: usize,
+        #[arg(long)]
+        mem0_targets: bool,
+        #[arg(long)]
+        mem0_result: Option<PathBuf>,
+        #[arg(long)]
+        locomo_dataset: Option<PathBuf>,
+        #[arg(long)]
+        locomo_evidence: Option<PathBuf>,
+        #[arg(long)]
+        locomo_predict_input: Option<PathBuf>,
+        #[arg(long, default_value_t = 50)]
+        top_k: usize,
+        #[arg(long, default_value = "raw")]
+        locomo_memory_source: String,
+        #[arg(long)]
+        locomo_predict_output: Option<PathBuf>,
+        #[arg(long)]
+        locomo_predict_dir: Option<PathBuf>,
+        #[arg(long)]
+        locomo_answer_tasks_output: Option<PathBuf>,
+        #[arg(long)]
+        locomo_answer_tasks_input: Option<PathBuf>,
+        #[arg(long)]
+        locomo_answer_prompt_char_budget: Option<usize>,
+        #[arg(long)]
+        locomo_retry_answer_tasks_output: Option<PathBuf>,
+        #[arg(long)]
+        locomo_answer_results: Option<PathBuf>,
+        #[arg(long)]
+        locomo_judge_tasks_output: Option<PathBuf>,
+        #[arg(long)]
+        locomo_retry_judge_tasks_output: Option<PathBuf>,
+        #[arg(long)]
+        locomo_judge_results: Option<PathBuf>,
+        #[arg(long)]
+        locomo_final_output: Option<PathBuf>,
+        #[arg(long)]
+        locomo_status_output: Option<PathBuf>,
+        #[arg(long)]
+        locomo_retention_output: Option<PathBuf>,
+        #[arg(long)]
+        locomo_report_output: Option<PathBuf>,
+        #[arg(long)]
+        locomo_host_manifest_input: Option<PathBuf>,
+        #[arg(long)]
+        locomo_target_output: Option<PathBuf>,
+        #[arg(long)]
+        locomo_require_beats_mem0: bool,
+        #[arg(long)]
+        locomo_fail_if_incomplete: bool,
+    },
     Forget {
         memory_id: String,
         #[arg(long)]
@@ -307,15 +368,18 @@ fn main() -> Result<()> {
                 .iter()
                 .find(|candidate| candidate.id == id)
                 .ok_or_else(|| anyhow!("candidate not found or already decided"))?;
+            let memory = memory_from_candidate(&tenant, &user, candidate);
+            let path = memory_path(&paths, &tenant, &user, &memory)?;
+            // Write the memory BEFORE recording the terminal decision: if the
+            // write fails the candidate stays pending and can be retried, instead
+            // of being permanently marked Accepted with no memory and no audit.
+            write_memory(&path, &memory)?;
             append_decision(
                 &hip.join("decisions.jsonl"),
                 &ReviewDecision::Accept {
                     candidate_id: id.clone(),
                 },
             )?;
-            let memory = memory_from_candidate(&tenant, &user, candidate);
-            let path = memory_path(&paths, &tenant, &user, &memory)?;
-            write_memory(&path, &memory)?;
             append_audit_event(
                 &audit,
                 candidate.scope,
@@ -401,7 +465,7 @@ fn main() -> Result<()> {
             println!("vacuumed {}", tenant_dir.display());
         }
         Command::Sleep { llm } => {
-            let jobs = noema_core::extraction::load_jobs(&cfg.storage.local_root)?;
+            let jobs = noema_core::extraction::load_jobs(&cfg.storage.local_root, &tenant)?;
             if llm {
                 println!(
                     "sleep queued {} extraction jobs for host LLM processing",
@@ -445,9 +509,225 @@ fn main() -> Result<()> {
                 index_dir.join("lexical.json").display()
             );
         }
+        Command::Bench {
+            memories,
+            queries,
+            iterations,
+            mem0_targets,
+            mem0_result,
+            locomo_dataset,
+            locomo_evidence,
+            locomo_predict_input,
+            top_k,
+            locomo_memory_source,
+            locomo_predict_output,
+            locomo_predict_dir,
+            locomo_answer_tasks_output,
+            locomo_answer_tasks_input,
+            locomo_answer_prompt_char_budget,
+            locomo_retry_answer_tasks_output,
+            locomo_answer_results,
+            locomo_judge_tasks_output,
+            locomo_retry_judge_tasks_output,
+            locomo_judge_results,
+            locomo_final_output,
+            locomo_status_output,
+            locomo_retention_output,
+            locomo_report_output,
+            locomo_host_manifest_input,
+            locomo_target_output,
+            locomo_require_beats_mem0,
+            locomo_fail_if_incomplete,
+        } => {
+            if mem0_targets {
+                println!("Mem0 benchmark targets");
+                println!();
+                println!("Noema must exceed every Mem0 score below before this benchmark goal is considered met.");
+                println!();
+                print!(
+                    "{}",
+                    noema_core::benchmark::mem0_reference_targets_markdown_table()
+                );
+                return Ok(());
+            }
+            if let Some(path) = mem0_result {
+                let text = std::fs::read_to_string(&path)?;
+                let summary = noema_core::benchmark::summarize_mem0_result_json(&text)?;
+                println!("Mem0 result summary");
+                println!();
+                println!(
+                    "benchmark={} total_questions={}",
+                    summary.benchmark, summary.total_questions
+                );
+                if let Some(latency) = summary.avg_search_latency_ms {
+                    println!("avg_search_latency_ms={latency:.1}");
+                }
+                if let Some(retrieved) = summary.avg_retrieved_memories {
+                    println!("avg_retrieved_memories={retrieved:.1}");
+                }
+                println!();
+                print!("{}", summary.to_markdown_table());
+                return Ok(());
+            }
+            if let Some(path) = locomo_dataset {
+                let text = std::fs::read_to_string(&path)?;
+                let summary = noema_core::benchmark::summarize_locomo_dataset_json(&text)?;
+                println!("LOCOMO dataset summary");
+                println!();
+                println!(
+                    "conversations={} sessions={} turns={} questions={} evaluable_questions={}",
+                    summary.conversations,
+                    summary.sessions,
+                    summary.turns,
+                    summary.questions,
+                    summary.evaluable_questions
+                );
+                println!(
+                    "evidence_refs={} resolved_evidence_refs={}",
+                    summary.evidence_refs, summary.resolved_evidence_refs
+                );
+                println!();
+                print!("{}", summary.to_markdown_table());
+                return Ok(());
+            }
+            if let Some(path) = locomo_predict_input {
+                let text = std::fs::read_to_string(&path)?;
+                let output: serde_json::Value = serde_json::from_str(&text)?;
+                write_locomo_predict_artifacts(
+                    &output,
+                    top_k,
+                    locomo_predict_output,
+                    locomo_predict_dir,
+                    locomo_answer_tasks_output,
+                    locomo_answer_tasks_input,
+                    locomo_answer_prompt_char_budget,
+                    locomo_retry_answer_tasks_output,
+                    locomo_answer_results,
+                    locomo_judge_tasks_output,
+                    locomo_retry_judge_tasks_output,
+                    locomo_judge_results,
+                    locomo_final_output,
+                    locomo_status_output,
+                    locomo_retention_output,
+                    locomo_report_output,
+                    locomo_host_manifest_input,
+                    locomo_target_output,
+                    locomo_require_beats_mem0,
+                    locomo_fail_if_incomplete,
+                )?;
+                return Ok(());
+            }
+            if let Some(path) = locomo_evidence {
+                let text = std::fs::read_to_string(&path)?;
+                let memory_source = locomo_memory_source.parse::<LocomoMemorySource>()?;
+                if locomo_predict_output.is_some()
+                    || locomo_predict_dir.is_some()
+                    || locomo_answer_tasks_output.is_some()
+                    || locomo_retention_output.is_some()
+                    || locomo_retry_answer_tasks_output.is_some()
+                    || locomo_judge_tasks_output.is_some()
+                    || locomo_retry_judge_tasks_output.is_some()
+                    || locomo_final_output.is_some()
+                    || locomo_status_output.is_some()
+                    || locomo_report_output.is_some()
+                    || locomo_host_manifest_input.is_some()
+                    || locomo_target_output.is_some()
+                    || locomo_require_beats_mem0
+                    || locomo_fail_if_incomplete
+                {
+                    let output = noema_core::benchmark::run_locomo_predict_json_with_source(
+                        &text,
+                        top_k,
+                        memory_source,
+                    )?;
+                    write_locomo_predict_artifacts(
+                        &output,
+                        top_k,
+                        locomo_predict_output,
+                        locomo_predict_dir,
+                        locomo_answer_tasks_output,
+                        locomo_answer_tasks_input,
+                        locomo_answer_prompt_char_budget,
+                        locomo_retry_answer_tasks_output,
+                        locomo_answer_results,
+                        locomo_judge_tasks_output,
+                        locomo_retry_judge_tasks_output,
+                        locomo_judge_results,
+                        locomo_final_output,
+                        locomo_status_output,
+                        locomo_retention_output,
+                        locomo_report_output,
+                        locomo_host_manifest_input,
+                        locomo_target_output,
+                        locomo_require_beats_mem0,
+                        locomo_fail_if_incomplete,
+                    )?;
+                    return Ok(());
+                }
+                let report = noema_core::benchmark::run_locomo_evidence_retrieval_json_with_source(
+                    &text,
+                    top_k,
+                    memory_source,
+                )?;
+                println!("LOCOMO evidence retrieval");
+                println!();
+                println!(
+                    "top_k={} questions={} memory_source={}",
+                    report.top_k, report.questions, report.memory_source
+                );
+                println!();
+                print!("{}", report.to_markdown_table());
+                return Ok(());
+            }
+            let bench_root = std::env::temp_dir().join(format!("noema-bench-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&bench_root)?;
+            let report = noema_core::benchmark::run_recall_benchmark(
+                &bench_root,
+                noema_core::benchmark::BenchmarkScenario {
+                    memory_count: memories,
+                    query_count: queries,
+                    iterations,
+                },
+            );
+            let cleanup = std::fs::remove_dir_all(&bench_root);
+            let report = report?;
+            cleanup?;
+            println!(
+                "Noema benchmark: memories={} queries={} iterations={} generated_bytes={}",
+                report.memory_count, report.query_count, report.iterations, report.generated_bytes
+            );
+            println!();
+            print!("{}", report.to_markdown_table());
+            println!();
+            print!("{}", report.to_phase_markdown_table());
+        }
         Command::Forget { memory_id, hard } => {
+            let _tenant_lock = FileLock::exclusive(tenant_dir.join("tenant.lock"))?;
+            let id = MemoryId::new(memory_id);
+            let path = find_memory_path(&paths, &tenant, &user, &id)
+                .ok_or_else(|| anyhow!("memory not found: {id}"))?;
+            let mut memory = read_memory(&path)?;
+            if hard {
+                // Hard erase removes the body file entirely; the tombstone is
+                // still audited so the deletion remains traceable.
+                std::fs::remove_file(&path)?;
+            } else {
+                // Soft delete tombstones the record and guarantees it can never
+                // be recalled again (recall skips non-Active and Never memories).
+                memory.status = MemoryStatus::Tombstoned;
+                memory.recall_policy.mode = RecallMode::Never;
+                write_memory(&path, &memory)?;
+            }
+            append_audit_event(
+                &audit,
+                memory.scope,
+                AuditAction::MemoryTombstoned,
+                None,
+                Some(id.clone()),
+                Some(if hard { "hard-erased" } else { "tombstoned" }.to_string()),
+            )?;
             let mode = if hard { "hard-erased" } else { "tombstoned" };
-            println!("{mode} {memory_id}");
+            println!("{mode} {id}");
         }
         Command::Offload {
             command: OffloadCommand::Status,
@@ -464,6 +744,325 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_locomo_predict_artifacts(
+    output: &serde_json::Value,
+    top_k: usize,
+    locomo_predict_output: Option<PathBuf>,
+    locomo_predict_dir: Option<PathBuf>,
+    locomo_answer_tasks_output: Option<PathBuf>,
+    locomo_answer_tasks_input: Option<PathBuf>,
+    locomo_answer_prompt_char_budget: Option<usize>,
+    locomo_retry_answer_tasks_output: Option<PathBuf>,
+    locomo_answer_results: Option<PathBuf>,
+    locomo_judge_tasks_output: Option<PathBuf>,
+    locomo_retry_judge_tasks_output: Option<PathBuf>,
+    locomo_judge_results: Option<PathBuf>,
+    locomo_final_output: Option<PathBuf>,
+    locomo_status_output: Option<PathBuf>,
+    locomo_retention_output: Option<PathBuf>,
+    locomo_report_output: Option<PathBuf>,
+    locomo_host_manifest_input: Option<PathBuf>,
+    locomo_target_output: Option<PathBuf>,
+    locomo_require_beats_mem0: bool,
+    locomo_fail_if_incomplete: bool,
+) -> Result<()> {
+    if let Some(output_path) = locomo_predict_output {
+        std::fs::write(&output_path, serde_json::to_vec_pretty(output)?)?;
+        println!("wrote LOCOMO predict JSON {}", output_path.display());
+    }
+    if let Some(output_dir) = locomo_predict_dir {
+        let count = write_mem0_locomo_predict_dir(&output_dir, output)?;
+        println!(
+            "wrote mem0-compatible LOCOMO predict dir {} files={}",
+            output_dir.display(),
+            count
+        );
+    }
+    if let Some(output_path) = locomo_answer_tasks_output {
+        let jsonl =
+            noema_core::benchmark::locomo_answer_tasks_jsonl_from_predict_with_prompt_budget(
+                output,
+                top_k,
+                locomo_answer_prompt_char_budget,
+            )?;
+        let count = jsonl.lines().count();
+        std::fs::write(&output_path, jsonl)?;
+        println!(
+            "wrote LOCOMO answer tasks {} tasks={}",
+            output_path.display(),
+            count
+        );
+    }
+    if let Some(output_path) = locomo_retry_answer_tasks_output {
+        let answers_path = locomo_answer_results.as_ref().ok_or_else(|| {
+            anyhow!("--locomo-answer-results is required with --locomo-retry-answer-tasks-output")
+        })?;
+        let answers = std::fs::read_to_string(answers_path)?;
+        let jsonl =
+            noema_core::benchmark::locomo_retry_answer_tasks_jsonl_from_results_with_prompt_budget(
+                output,
+                &answers,
+                top_k,
+                locomo_answer_prompt_char_budget,
+            )?;
+        let count = jsonl.lines().count();
+        std::fs::write(&output_path, jsonl)?;
+        println!(
+            "wrote LOCOMO retry answer tasks {} tasks={}",
+            output_path.display(),
+            count
+        );
+    }
+    if let Some(output_path) = locomo_retention_output {
+        let tasks_path = locomo_answer_tasks_input.as_ref().ok_or_else(|| {
+            anyhow!("--locomo-answer-tasks-input is required with --locomo-retention-output")
+        })?;
+        let answer_tasks = std::fs::read_to_string(tasks_path)?;
+        let audit = noema_core::benchmark::locomo_answer_prompt_retention_json_from_tasks(
+            output,
+            &answer_tasks,
+            top_k,
+        )?;
+        std::fs::write(&output_path, serde_json::to_vec_pretty(&audit)?)?;
+        println!(
+            "wrote LOCOMO answer prompt retention {}",
+            output_path.display()
+        );
+    }
+    if let Some(output_path) = locomo_judge_tasks_output {
+        let answers_path = locomo_answer_results.as_ref().ok_or_else(|| {
+            anyhow!("--locomo-answer-results is required with --locomo-judge-tasks-output")
+        })?;
+        let answers = std::fs::read_to_string(answers_path)?;
+        let jsonl =
+            noema_core::benchmark::locomo_judge_tasks_jsonl_from_answers(output, &answers, top_k)?;
+        let count = jsonl.lines().count();
+        std::fs::write(&output_path, jsonl)?;
+        println!(
+            "wrote LOCOMO judge tasks {} tasks={}",
+            output_path.display(),
+            count
+        );
+    }
+    if let Some(output_path) = locomo_retry_judge_tasks_output {
+        let answers_path = locomo_answer_results.as_ref().ok_or_else(|| {
+            anyhow!("--locomo-answer-results is required with --locomo-retry-judge-tasks-output")
+        })?;
+        let judgments_path = locomo_judge_results.as_ref().ok_or_else(|| {
+            anyhow!("--locomo-judge-results is required with --locomo-retry-judge-tasks-output")
+        })?;
+        let answers = std::fs::read_to_string(answers_path)?;
+        let judgments = std::fs::read_to_string(judgments_path)?;
+        let jsonl = noema_core::benchmark::locomo_retry_judge_tasks_jsonl_from_results(
+            output, &answers, &judgments, top_k,
+        )?;
+        let count = jsonl.lines().count();
+        std::fs::write(&output_path, jsonl)?;
+        println!(
+            "wrote LOCOMO retry judge tasks {} tasks={}",
+            output_path.display(),
+            count
+        );
+    }
+    if let Some(output_path) = locomo_final_output {
+        let answers_path = locomo_answer_results.as_ref().ok_or_else(|| {
+            anyhow!("--locomo-answer-results is required with --locomo-final-output")
+        })?;
+        let judgments_path = locomo_judge_results.as_ref().ok_or_else(|| {
+            anyhow!("--locomo-judge-results is required with --locomo-final-output")
+        })?;
+        let answers = std::fs::read_to_string(answers_path)?;
+        let judgments = std::fs::read_to_string(judgments_path)?;
+        let final_result = noema_core::benchmark::locomo_final_result_json_from_judgments(
+            output, &answers, &judgments, top_k,
+        )?;
+        std::fs::write(&output_path, serde_json::to_vec_pretty(&final_result)?)?;
+        println!("wrote LOCOMO final result {}", output_path.display());
+    }
+    if let Some(output_path) = locomo_status_output {
+        let answers = locomo_answer_results
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?;
+        let judgments = locomo_judge_results
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?;
+        let status = noema_core::benchmark::locomo_status_json_from_results(
+            output,
+            answers.as_deref(),
+            judgments.as_deref(),
+            top_k,
+        )?;
+        std::fs::write(&output_path, serde_json::to_vec_pretty(&status)?)?;
+        println!("wrote LOCOMO status {}", output_path.display());
+    }
+    if let Some(output_path) = locomo_report_output {
+        let answer_tasks = locomo_answer_tasks_input
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?;
+        let answers = locomo_answer_results
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?;
+        let judgments = locomo_judge_results
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?;
+        let host_manifest = locomo_host_manifest_input
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?;
+        let report =
+            noema_core::benchmark::locomo_run_report_json_from_artifacts_with_host_manifest(
+                output,
+                answer_tasks.as_deref(),
+                answers.as_deref(),
+                judgments.as_deref(),
+                host_manifest.as_deref(),
+                top_k,
+            )?;
+        std::fs::write(&output_path, serde_json::to_vec_pretty(&report)?)?;
+        println!("wrote LOCOMO run report {}", output_path.display());
+    }
+    if locomo_fail_if_incomplete {
+        let answer_tasks = locomo_answer_tasks_input
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?;
+        let answers = locomo_answer_results
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?;
+        let judgments = locomo_judge_results
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?;
+        let host_manifest = locomo_host_manifest_input
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()?;
+        let report =
+            noema_core::benchmark::locomo_run_report_json_from_artifacts_with_host_manifest(
+                output,
+                answer_tasks.as_deref(),
+                answers.as_deref(),
+                judgments.as_deref(),
+                host_manifest.as_deref(),
+                top_k,
+            )?;
+        let final_ready = report
+            .get("completion")
+            .and_then(|completion| completion.get("final_ready"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !final_ready {
+            let blocked_reason = report
+                .get("completion")
+                .and_then(|completion| completion.get("blocked_reason"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let next_action = report
+                .get("next_action")
+                .and_then(|next_action| next_action.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("inspect");
+            let retryable = report
+                .get("next_action")
+                .and_then(|next_action| next_action.get("retryable"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let provider_blocker = report
+                .get("next_action")
+                .and_then(|next_action| next_action.get("provider_blocker_reason"))
+                .and_then(serde_json::Value::as_str)
+                .map(|reason| format!(" provider_blocker_reason={reason}"))
+                .unwrap_or_default();
+            return Err(anyhow!(
+                "LOCOMO run incomplete: blocked_reason={blocked_reason} next_action={next_action} retryable={retryable}{provider_blocker}"
+            ));
+        }
+        println!("LOCOMO run ready for final scoring");
+    }
+    if locomo_target_output.is_some() || locomo_require_beats_mem0 {
+        let answers_path = locomo_answer_results.as_ref().ok_or_else(|| {
+            anyhow!("--locomo-answer-results is required with LOCOMO target checks")
+        })?;
+        let judgments_path = locomo_judge_results.as_ref().ok_or_else(|| {
+            anyhow!("--locomo-judge-results is required with LOCOMO target checks")
+        })?;
+        let answers = std::fs::read_to_string(answers_path)?;
+        let judgments = std::fs::read_to_string(judgments_path)?;
+        let final_result = noema_core::benchmark::locomo_final_result_json_from_judgments(
+            output, &answers, &judgments, top_k,
+        )?;
+        let verdict = noema_core::benchmark::locomo_target_verdict_json(&final_result, top_k)?;
+        if let Some(output_path) = locomo_target_output {
+            std::fs::write(&output_path, serde_json::to_vec_pretty(&verdict)?)?;
+            println!("wrote LOCOMO target verdict {}", output_path.display());
+        }
+        if locomo_require_beats_mem0 {
+            let exceeds_mem0 = verdict
+                .get("exceeds_mem0")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let score = verdict
+                .get("score")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            let benchmark = verdict
+                .get("benchmark")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("LoCoMo");
+            let mem0_score = verdict
+                .get("mem0_score")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(92.5);
+            if !exceeds_mem0 {
+                return Err(anyhow!(
+                    "LOCOMO score {score:.1} does not exceed Mem0 {benchmark} target {mem0_score:.1}"
+                ));
+            }
+            println!("LOCOMO score {score:.1} exceeds Mem0 {benchmark} target {mem0_score:.1}");
+        }
+    }
+    Ok(())
+}
+
+fn write_mem0_locomo_predict_dir(path: &Path, output: &serde_json::Value) -> Result<usize> {
+    std::fs::create_dir_all(path)?;
+    let evaluations = output
+        .get("evaluations")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("LOCOMO predict output missing evaluations"))?;
+    for evaluation in evaluations {
+        let question_id = evaluation
+            .get("question_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("LOCOMO predict evaluation missing question_id"))?;
+        let mut item = evaluation.clone();
+        if let Some(obj) = item.as_object_mut() {
+            obj.remove("cutoff_results");
+        }
+        std::fs::write(
+            path.join(format!("{question_id}.json")),
+            serde_json::to_vec_pretty(&item)?,
+        )?;
+    }
+    std::fs::write(
+        path.join("_noema_predict_summary.json"),
+        serde_json::to_vec_pretty(&json!({
+            "metadata": output.get("metadata").cloned().unwrap_or_default(),
+            "metrics_by_cutoff": output.get("metrics_by_cutoff").cloned().unwrap_or_default(),
+            "evaluations": evaluations.len(),
+            "note": "Per-question files omit cutoff_results so mem0 evaluate-only can run answerer/judge without --rejudge."
+        }))?,
+    )?;
+    Ok(evaluations.len())
 }
 
 fn memory_from_candidate(tenant: &TenantId, user: &UserId, candidate: &Candidate) -> MemoryRecord {
@@ -514,6 +1113,30 @@ fn memory_path(
         Scope::User | Scope::Team | Scope::Org => paths.user_cortex_dir(tenant, user),
     };
     Ok(dir.join(format!("{}.md", memory.id)))
+}
+
+/// Locate an existing memory `.md` file by id across the user cortex and every
+/// project cortex dir under the tenant. Returns the path if the file exists.
+fn find_memory_path(
+    paths: &NoemaPaths,
+    tenant: &TenantId,
+    user: &UserId,
+    id: &MemoryId,
+) -> Option<PathBuf> {
+    let user_path = paths.user_cortex_dir(tenant, user).join(format!("{id}.md"));
+    if user_path.exists() {
+        return Some(user_path);
+    }
+    let projects = paths.tenant_dir(tenant).join("projects");
+    if let Ok(entries) = std::fs::read_dir(&projects) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("cortex").join(format!("{id}.md"));
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 struct AuditContext<'a> {

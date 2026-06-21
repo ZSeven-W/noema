@@ -8,7 +8,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-noema-core = { path = "../noema-core" }
+noema-core = { path = "../noema-core", features = ["benchmark"] }
 serde_json.workspace = true
 uuid.workspace = true
 

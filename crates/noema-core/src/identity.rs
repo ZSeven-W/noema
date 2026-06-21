@@ -83,4 +83,22 @@ mod tests {
         let claims = sample_claims();
         assert!(sign_principal(&claims, b"short").is_err());
     }
+
+    #[test]
+    fn verify_rejects_expired_token() {
+        // exp in the past (year 2001) — token must be rejected
+        let mut claims = sample_claims();
+        claims.exp = 1_000_000_000;
+        let token = sign_principal(&claims, SECRET).unwrap();
+        assert!(verify_principal(&token, SECRET).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_tampered_signature() {
+        // flip one character in the signature segment (after the last '.')
+        let mut token = sign_principal(&sample_claims(), SECRET).unwrap();
+        let last = token.pop().unwrap();
+        token.push(if last == 'a' { 'b' } else { 'a' });
+        assert!(verify_principal(&token, SECRET).is_err());
+    }
 }

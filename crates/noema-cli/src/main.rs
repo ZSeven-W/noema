@@ -1,22 +1,14 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use noema_core::audit::{append_audit, AuditAction, AuditEvent};
-use noema_core::benchmark::LocomoMemorySource;
-use noema_core::config::{NoemaConfig, TenantMode};
-use noema_core::hippocampus::{
-    append_candidate, append_decision, load_candidates, load_decisions, pending_candidates,
-    Candidate, ReviewDecision,
+use noema_core::api::{
+    ExplainRequest, ForgetRequest, NoemaEngine, RememberRequest, ReviewAction,
+    ReviewDecisionRequest, SearchRequest, SubmitOutcome,
 };
-use noema_core::ids::{CandidateId, MemoryId, ProjectId, TenantId, UserId};
-use noema_core::lock::FileLock;
-use noema_core::memory::{MemoryKind, MemoryRecord, MemoryStatus, RecallMode, Scope, Visibility};
+use noema_core::benchmark::LocomoMemorySource;
+use noema_core::config::NoemaConfig;
+use noema_core::memory::{MemoryKind, Scope};
 use noema_core::paths::NoemaPaths;
-use noema_core::project::project_id_from_path;
-use noema_core::recall::{explain_memory, recall};
-use noema_core::review::{route_candidate, CandidateRoute};
 use noema_core::sensitivity::{Principal, SensitivityLevel};
-use noema_core::store::{read_memory, write_memory};
-use serde_json::json;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -171,18 +163,16 @@ fn main() -> Result<()> {
     } else {
         NoemaConfig::load_or_default()?
     };
-    let paths = NoemaPaths::new(&cfg.storage.local_root);
-    let user = UserId::new(cfg.tenant.default_user_id.clone());
-    let tenant = TenantId::new(cfg.tenant.id.clone());
-    let tenant_dir = paths.tenant_dir(&tenant);
-    let audit = AuditContext {
-        tenant_dir: &tenant_dir,
-        tenant: &tenant,
-        user: &user,
-    };
+
+    // Build engine and principal once; Init does not need them.
+    let engine = NoemaEngine::from_config(&cfg)?;
+    let mut principal = Principal::personal(&cfg.tenant.default_user_id, "noema-cli");
+    principal.tenant_id = noema_core::ids::TenantId::new(cfg.tenant.id.clone());
 
     match cli.command {
         Command::Init => {
+            let paths = NoemaPaths::new(&cfg.storage.local_root);
+            let user = noema_core::ids::UserId::new(cfg.tenant.default_user_id.clone());
             paths.init_personal_layout(&user)?;
             std::fs::write(cfg.storage.local_root.join("config.toml"), cfg.to_toml()?)?;
             println!("initialized {}", cfg.storage.local_root.display());
@@ -197,88 +187,28 @@ fn main() -> Result<()> {
             confidence,
             importance,
         } => {
-            paths.init_personal_layout(&user)?;
-            let _tenant_lock = FileLock::exclusive(tenant_dir.join("tenant.lock"))?;
-            let current_project = project_id_from_path(&std::env::current_dir()?);
-            let mut candidate =
-                Candidate::new(CandidateId::new(format!("cand_{}", Uuid::new_v4())), text);
-            candidate.tenant_id = tenant.clone();
-            candidate.owner_user_id = user.clone();
-            candidate.scope = parse_scope(&scope)?;
-            reject_unsupported_personal_scope(cfg.tenant.mode, candidate.scope)?;
-            candidate.kind = parse_kind(&kind)?;
-            candidate.sensitivity = parse_sensitivity(&sensitivity)?;
-            reject_unsupported_personal_sensitivity(cfg.tenant.mode, candidate.sensitivity)?;
-            candidate.confidence = confidence;
-            candidate.importance = importance;
-            candidate.tags = tags;
-            candidate.entities = entities;
-            if candidate.scope == Scope::Project {
-                candidate.project_id = Some(current_project);
-            }
-
-            let inbox = paths.tenant_dir(&tenant).join("hippocampus/inbox.jsonl");
-            let active_memories =
-                load_recall_memories(&paths, &tenant, &user, candidate.project_id.as_ref())?;
-            match route_candidate(
-                cfg.policy.write,
-                cfg.sensitive.auto_accept_max_sensitivity,
-                &candidate,
-                &active_memories,
-            ) {
-                CandidateRoute::RejectSecret => {
-                    append_audit_event(
-                        &audit,
-                        candidate.scope,
-                        AuditAction::CandidateRejectedSecret,
-                        Some(candidate.id.clone()),
-                        None,
-                        Some("secret sensitivity cannot enter review".to_string()),
-                    )?;
-                    return Err(anyhow!("secret candidates are rejected before review"));
-                }
-                CandidateRoute::PendingReview => {
-                    append_candidate(&inbox, &candidate)?;
-                    append_audit_event(
-                        &audit,
-                        candidate.scope,
-                        AuditAction::CandidateQueued,
-                        Some(candidate.id.clone()),
-                        None,
-                        None,
-                    )?;
-                    println!("queued {}", candidate.id);
-                }
-                CandidateRoute::AutoAccept => {
-                    let memory = memory_from_candidate(&tenant, &user, &candidate);
-                    let path = memory_path(&paths, &tenant, &user, &memory)?;
-                    write_memory(&path, &memory)?;
-                    append_audit_event(
-                        &audit,
-                        candidate.scope,
-                        AuditAction::CandidateAutoAccepted,
-                        Some(candidate.id.clone()),
-                        Some(memory.id.clone()),
-                        None,
-                    )?;
-                    append_audit_event(
-                        &audit,
-                        candidate.scope,
-                        AuditAction::MemoryWritten,
-                        None,
-                        Some(memory.id.clone()),
-                        None,
-                    )?;
-                    println!("accepted {}", memory.id);
+            let outcome = engine.submit_candidate(RememberRequest {
+                principal: principal.clone(),
+                text,
+                scope: parse_scope(&scope)?,
+                project_path: std::env::current_dir().ok(),
+                kind: parse_kind(&kind)?,
+                sensitivity: parse_sensitivity(&sensitivity)?,
+                tags,
+                entities,
+                confidence,
+                importance,
+            })?;
+            match outcome {
+                SubmitOutcome::Queued { candidate_id } => println!("queued {candidate_id}"),
+                SubmitOutcome::AutoAccepted { memory_id } => println!("accepted {memory_id}"),
+                SubmitOutcome::RejectedSecret => {
+                    return Err(anyhow!("secret candidates are rejected before review"))
                 }
             }
         }
         Command::Review => {
-            let hip = paths.tenant_dir(&tenant).join("hippocampus");
-            let candidates = load_candidates(&hip.join("inbox.jsonl"))?;
-            let decisions = load_decisions(&hip.join("decisions.jsonl"))?;
-            let pending = pending_candidates(&candidates, &decisions);
-            for candidate in pending {
+            for candidate in engine.review_list(&principal)? {
                 println!("{} {}", candidate.id, candidate.body);
             }
         }
@@ -287,185 +217,92 @@ fn main() -> Result<()> {
             body,
             reason,
         } => {
-            let _tenant_lock = FileLock::exclusive(tenant_dir.join("tenant.lock"))?;
-            let hip = paths.tenant_dir(&tenant).join("hippocampus");
-            let id = CandidateId::new(candidate_id);
-            let candidates = load_candidates(&hip.join("inbox.jsonl"))?;
-            let decisions = load_decisions(&hip.join("decisions.jsonl"))?;
-            let candidate = pending_candidates(&candidates, &decisions)
-                .into_iter()
-                .find(|candidate| candidate.id == id)
-                .ok_or_else(|| anyhow!("candidate not found or already decided"))?;
-            append_decision(
-                &hip.join("decisions.jsonl"),
-                &ReviewDecision::Edit {
-                    candidate_id: id.clone(),
-                    body,
-                    reason: reason.clone(),
-                },
-            )?;
-            append_audit_event(
-                &audit,
-                candidate.scope,
-                AuditAction::CandidateEdited,
-                Some(id.clone()),
-                None,
-                Some(reason),
-            )?;
-            println!("edited {}", id);
+            engine.review_decide(ReviewDecisionRequest {
+                principal: principal.clone(),
+                candidate_id: candidate_id.clone(),
+                action: ReviewAction::Edit { body, reason },
+            })?;
+            println!("edited {candidate_id}");
         }
         Command::Merge {
             candidate_id,
             target_memory_id,
             reason,
         } => {
-            let _tenant_lock = FileLock::exclusive(tenant_dir.join("tenant.lock"))?;
-            let hip = paths.tenant_dir(&tenant).join("hippocampus");
-            let id = CandidateId::new(candidate_id);
-            let target = MemoryId::new(target_memory_id);
-            let candidates = load_candidates(&hip.join("inbox.jsonl"))?;
-            let decisions = load_decisions(&hip.join("decisions.jsonl"))?;
-            let candidate = pending_candidates(&candidates, &decisions)
-                .into_iter()
-                .find(|candidate| candidate.id == id)
-                .ok_or_else(|| anyhow!("candidate not found or already decided"))?;
-            let active_memories =
-                load_recall_memories(&paths, &tenant, &user, candidate.project_id.as_ref())?;
-            if !active_memories
-                .iter()
-                .any(|memory| memory.id.as_str() == target.as_str())
-            {
-                return Err(anyhow!("target memory not found"));
-            }
-            // P0 merge records the duplicate relationship and removes the candidate
-            // from review. Content consolidation into the target memory is deferred.
-            append_decision(
-                &hip.join("decisions.jsonl"),
-                &ReviewDecision::Merge {
-                    candidate_id: id.clone(),
-                    target_memory_id: target.clone(),
-                    reason: reason.clone(),
+            engine.review_decide(ReviewDecisionRequest {
+                principal: principal.clone(),
+                candidate_id: candidate_id.clone(),
+                action: ReviewAction::Merge {
+                    target_memory_id,
+                    reason,
                 },
-            )?;
-            append_audit_event(
-                &audit,
-                candidate.scope,
-                AuditAction::CandidateMerged,
-                Some(id.clone()),
-                Some(target),
-                Some(reason),
-            )?;
-            println!("merged {}", id);
+            })?;
+            println!("merged {candidate_id}");
         }
         Command::Accept { candidate_id } => {
-            let _tenant_lock = FileLock::exclusive(tenant_dir.join("tenant.lock"))?;
-            let hip = paths.tenant_dir(&tenant).join("hippocampus");
-            let candidates = load_candidates(&hip.join("inbox.jsonl"))?;
-            let decisions = load_decisions(&hip.join("decisions.jsonl"))?;
-            let id = CandidateId::new(candidate_id);
-            let pending = pending_candidates(&candidates, &decisions);
-            let candidate = pending
-                .iter()
-                .find(|candidate| candidate.id == id)
-                .ok_or_else(|| anyhow!("candidate not found or already decided"))?;
-            let memory = memory_from_candidate(&tenant, &user, candidate);
-            let path = memory_path(&paths, &tenant, &user, &memory)?;
-            // Write the memory BEFORE recording the terminal decision: if the
-            // write fails the candidate stays pending and can be retried, instead
-            // of being permanently marked Accepted with no memory and no audit.
-            write_memory(&path, &memory)?;
-            append_decision(
-                &hip.join("decisions.jsonl"),
-                &ReviewDecision::Accept {
-                    candidate_id: id.clone(),
-                },
-            )?;
-            append_audit_event(
-                &audit,
-                candidate.scope,
-                AuditAction::CandidateAccepted,
-                Some(id.clone()),
-                Some(memory.id.clone()),
-                None,
-            )?;
-            append_audit_event(
-                &audit,
-                candidate.scope,
-                AuditAction::MemoryWritten,
-                None,
-                Some(memory.id.clone()),
-                None,
-            )?;
-            println!("accepted {}", id);
+            let out = engine.review_decide(ReviewDecisionRequest {
+                principal: principal.clone(),
+                candidate_id: candidate_id.clone(),
+                action: ReviewAction::Accept,
+            })?;
+            // Print the candidate_id to preserve the output format the existing
+            // CLI used (which printed the CandidateId, not the MemoryId).
+            let _ = out; // ReviewOutcome::Accepted{memory_id} available if needed
+            println!("accepted {candidate_id}");
         }
         Command::Reject {
             candidate_id,
             reason,
         } => {
-            let _tenant_lock = FileLock::exclusive(tenant_dir.join("tenant.lock"))?;
-            let hip = paths.tenant_dir(&tenant).join("hippocampus");
-            let id = CandidateId::new(candidate_id);
-            let candidates = load_candidates(&hip.join("inbox.jsonl"))?;
-            let decisions = load_decisions(&hip.join("decisions.jsonl"))?;
-            let pending = pending_candidates(&candidates, &decisions);
-            let candidate = pending
-                .iter()
-                .find(|candidate| candidate.id == id)
-                .ok_or_else(|| anyhow!("candidate not found or already decided"))?;
-            append_decision(
-                &hip.join("decisions.jsonl"),
-                &ReviewDecision::Reject {
-                    candidate_id: id.clone(),
-                    reason: reason.clone(),
-                },
-            )?;
-            append_audit_event(
-                &audit,
-                candidate.scope,
-                AuditAction::CandidateRejected,
-                Some(id.clone()),
-                None,
-                Some(reason),
-            )?;
-            println!("rejected {}", id);
+            engine.review_decide(ReviewDecisionRequest {
+                principal: principal.clone(),
+                candidate_id: candidate_id.clone(),
+                action: ReviewAction::Reject { reason },
+            })?;
+            println!("rejected {candidate_id}");
         }
         Command::Search { query } => {
-            let current_project = project_id_from_path(&std::env::current_dir()?);
-            let principal = personal_principal(&tenant, &user);
-            let memories = load_recall_memories(&paths, &tenant, &user, Some(&current_project))?;
-            for scored in recall(&query, &principal, Some(&current_project), &memories) {
+            let cwd = std::env::current_dir().ok();
+            for scored in engine.search(SearchRequest {
+                principal: principal.clone(),
+                query,
+                cwd,
+            })? {
                 println!("{:.3} {}", scored.score, scored.id);
             }
         }
         Command::Explain { memory_id, query } => {
-            let current_project = project_id_from_path(&std::env::current_dir()?);
-            let principal = personal_principal(&tenant, &user);
-            let memories = load_recall_memories(&paths, &tenant, &user, Some(&current_project))?;
-            let memory = memories
-                .iter()
-                .find(|memory| memory.id.as_str() == memory_id)
-                .ok_or_else(|| anyhow!("memory not found"))?;
-            if let Some(scored) = explain_memory(&query, &principal, Some(&current_project), memory)
-            {
+            let cwd = std::env::current_dir().ok();
+            if let Some(scored) = engine.explain(ExplainRequest {
+                principal: principal.clone(),
+                memory_id,
+                query,
+                cwd,
+            })? {
                 println!("{}", scored.explanation.join("\n"));
             }
         }
         Command::Vacuum => {
-            let tenant_dir = paths.tenant_dir(&tenant);
-            let _tenant_lock = FileLock::exclusive(tenant_dir.join("tenant.lock"))?;
+            let tenant = &principal.tenant_id;
+            let tenant_dir = engine.paths.tenant_dir(tenant);
+            let _tenant_lock =
+                noema_core::lock::FileLock::exclusive(tenant_dir.join("tenant.lock"))?;
             noema_core::vacuum::compact_hippocampus(&tenant_dir)?;
-            append_audit_event(
-                &audit,
-                Scope::User,
-                AuditAction::VacuumCompacted,
-                None,
-                None,
-                None,
-            )?;
+            let mut event = noema_core::audit::AuditEvent::new(
+                tenant.clone(),
+                principal.user_id.clone(),
+                noema_core::memory::Scope::User,
+                noema_core::audit::AuditAction::VacuumCompacted,
+            );
+            event.candidate_id = None;
+            event.memory_id = None;
+            event.reason = None;
+            noema_core::audit::append_audit(&tenant_dir, &event)?;
             println!("vacuumed {}", tenant_dir.display());
         }
         Command::Sleep { llm } => {
-            let jobs = noema_core::extraction::load_jobs(&cfg.storage.local_root, &tenant)?;
+            let tenant = &principal.tenant_id;
+            let jobs = noema_core::extraction::load_jobs(&cfg.storage.local_root, tenant)?;
             if llm {
                 println!(
                     "sleep queued {} extraction jobs for host LLM processing",
@@ -489,8 +326,14 @@ fn main() -> Result<()> {
             );
         }
         Command::Reindex => {
+            let tenant = &principal.tenant_id;
+            let user = &principal.user_id;
             let mut index = noema_core::index::LexicalIndex::default();
-            for memory in load_recall_memories(&paths, &tenant, &user, None)? {
+            // Load memories via the engine's paths (same layout as before).
+            let user_cortex = engine.paths.user_cortex_dir(tenant, user);
+            let mut memories = Vec::new();
+            load_memory_dir_reindex(&user_cortex, &mut memories)?;
+            for memory in memories {
                 index.add(noema_core::index::IndexDocument {
                     id: memory.id,
                     text: memory.body,
@@ -498,7 +341,7 @@ fn main() -> Result<()> {
                     entities: memory.entities,
                 });
             }
-            let index_dir = paths.tenant_dir(&tenant).join("indexes");
+            let index_dir = engine.paths.tenant_dir(tenant).join("indexes");
             std::fs::create_dir_all(&index_dir)?;
             std::fs::write(
                 index_dir.join("lexical.json"),
@@ -702,32 +545,12 @@ fn main() -> Result<()> {
             print!("{}", report.to_phase_markdown_table());
         }
         Command::Forget { memory_id, hard } => {
-            let _tenant_lock = FileLock::exclusive(tenant_dir.join("tenant.lock"))?;
-            let id = MemoryId::new(memory_id);
-            let path = find_memory_path(&paths, &tenant, &user, &id)
-                .ok_or_else(|| anyhow!("memory not found: {id}"))?;
-            let mut memory = read_memory(&path)?;
-            if hard {
-                // Hard erase removes the body file entirely; the tombstone is
-                // still audited so the deletion remains traceable.
-                std::fs::remove_file(&path)?;
-            } else {
-                // Soft delete tombstones the record and guarantees it can never
-                // be recalled again (recall skips non-Active and Never memories).
-                memory.status = MemoryStatus::Tombstoned;
-                memory.recall_policy.mode = RecallMode::Never;
-                write_memory(&path, &memory)?;
-            }
-            append_audit_event(
-                &audit,
-                memory.scope,
-                AuditAction::MemoryTombstoned,
-                None,
-                Some(id.clone()),
-                Some(if hard { "hard-erased" } else { "tombstoned" }.to_string()),
-            )?;
-            let mode = if hard { "hard-erased" } else { "tombstoned" };
-            println!("{mode} {id}");
+            let out = engine.forget(ForgetRequest {
+                principal: principal.clone(),
+                memory_id,
+                hard,
+            })?;
+            println!("{} {}", out.mode, out.memory_id);
         }
         Command::Offload {
             command: OffloadCommand::Status,
@@ -741,6 +564,24 @@ fn main() -> Result<()> {
         }
         Command::Restore { snapshot_or_id } => {
             println!("restore {snapshot_or_id} completed after applying deletion manifests");
+        }
+    }
+    Ok(())
+}
+
+/// Load memory records from a directory for the Reindex command.
+/// Only used by the local Reindex arm; normal recall goes through the engine.
+fn load_memory_dir_reindex(
+    dir: &Path,
+    out: &mut Vec<noema_core::memory::MemoryRecord>,
+) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.path().extension().and_then(|s| s.to_str()) == Some("md") {
+            out.push(noema_core::store::read_memory(&entry.path())?);
         }
     }
     Ok(())
@@ -1034,6 +875,7 @@ fn write_locomo_predict_artifacts(
 }
 
 fn write_mem0_locomo_predict_dir(path: &Path, output: &serde_json::Value) -> Result<usize> {
+    use serde_json::json;
     std::fs::create_dir_all(path)?;
     let evaluations = output
         .get("evaluations")
@@ -1065,135 +907,6 @@ fn write_mem0_locomo_predict_dir(path: &Path, output: &serde_json::Value) -> Res
     Ok(evaluations.len())
 }
 
-fn memory_from_candidate(tenant: &TenantId, user: &UserId, candidate: &Candidate) -> MemoryRecord {
-    let memory_id = MemoryId::new(candidate.id.as_str().replacen("cand_", "mem_", 1));
-    let mut memory = MemoryRecord::new_user_preference(
-        memory_id,
-        tenant.clone(),
-        user.clone(),
-        candidate.body.clone(),
-    );
-    memory.scope = candidate.scope;
-    memory.project_id = candidate.project_id.clone();
-    memory.team_id = candidate.team_id.clone();
-    memory.kind = candidate.kind;
-    memory.visibility = match candidate.scope {
-        Scope::Project => Visibility::Project,
-        Scope::Team => Visibility::Team,
-        Scope::Org => Visibility::Org,
-        Scope::User => Visibility::Private,
-    };
-    memory.confidence = candidate.confidence;
-    memory.importance = candidate.importance;
-    memory.sensitivity = candidate.sensitivity;
-    if !candidate.sensitivity.can_auto_accept() {
-        memory.recall_policy.mode = RecallMode::Never;
-    }
-    memory.data_classes = candidate.data_classes.clone();
-    memory.tags = candidate.tags.clone();
-    memory.entities = candidate.entities.clone();
-    memory.source = candidate.source.clone();
-    memory
-}
-
-fn memory_path(
-    paths: &NoemaPaths,
-    tenant: &TenantId,
-    user: &UserId,
-    memory: &MemoryRecord,
-) -> Result<PathBuf> {
-    let dir = match memory.scope {
-        Scope::Project => {
-            let project = memory
-                .project_id
-                .as_ref()
-                .ok_or_else(|| anyhow!("project memory missing project_id"))?;
-            paths.project_cortex_dir(tenant, project)
-        }
-        Scope::User | Scope::Team | Scope::Org => paths.user_cortex_dir(tenant, user),
-    };
-    Ok(dir.join(format!("{}.md", memory.id)))
-}
-
-/// Locate an existing memory `.md` file by id across the user cortex and every
-/// project cortex dir under the tenant. Returns the path if the file exists.
-fn find_memory_path(
-    paths: &NoemaPaths,
-    tenant: &TenantId,
-    user: &UserId,
-    id: &MemoryId,
-) -> Option<PathBuf> {
-    let user_path = paths.user_cortex_dir(tenant, user).join(format!("{id}.md"));
-    if user_path.exists() {
-        return Some(user_path);
-    }
-    let projects = paths.tenant_dir(tenant).join("projects");
-    if let Ok(entries) = std::fs::read_dir(&projects) {
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("cortex").join(format!("{id}.md"));
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-struct AuditContext<'a> {
-    tenant_dir: &'a Path,
-    tenant: &'a TenantId,
-    user: &'a UserId,
-}
-
-fn append_audit_event(
-    audit: &AuditContext<'_>,
-    scope: Scope,
-    action: AuditAction,
-    candidate_id: Option<CandidateId>,
-    memory_id: Option<MemoryId>,
-    reason: Option<String>,
-) -> Result<()> {
-    let mut event = AuditEvent::new(audit.tenant.clone(), audit.user.clone(), scope, action);
-    event.candidate_id = candidate_id;
-    event.memory_id = memory_id;
-    event.reason = reason;
-    append_audit(audit.tenant_dir, &event)?;
-    Ok(())
-}
-
-fn personal_principal(tenant: &TenantId, user: &UserId) -> Principal {
-    let mut principal = Principal::personal(user.as_str(), "noema-cli");
-    principal.tenant_id = tenant.clone();
-    principal
-}
-
-fn load_recall_memories(
-    paths: &NoemaPaths,
-    tenant: &TenantId,
-    user: &UserId,
-    project: Option<&ProjectId>,
-) -> Result<Vec<MemoryRecord>> {
-    let mut out = Vec::new();
-    load_memory_dir(&paths.user_cortex_dir(tenant, user), &mut out)?;
-    if let Some(project) = project {
-        load_memory_dir(&paths.project_cortex_dir(tenant, project), &mut out)?;
-    }
-    Ok(out)
-}
-
-fn load_memory_dir(dir: &Path, out: &mut Vec<MemoryRecord>) -> Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.path().extension().and_then(|s| s.to_str()) == Some("md") {
-            out.push(read_memory(&entry.path())?);
-        }
-    }
-    Ok(())
-}
-
 fn parse_scope(value: &str) -> Result<Scope> {
     match value {
         "user" => Ok(Scope::User),
@@ -1202,30 +915,6 @@ fn parse_scope(value: &str) -> Result<Scope> {
         "org" => Ok(Scope::Org),
         _ => Err(anyhow!("invalid scope: {value}")),
     }
-}
-
-fn reject_unsupported_personal_scope(mode: TenantMode, scope: Scope) -> Result<()> {
-    if mode == TenantMode::Personal && matches!(scope, Scope::Team | Scope::Org) {
-        return Err(anyhow!("team and org scope require enterprise mode"));
-    }
-    Ok(())
-}
-
-fn reject_unsupported_personal_sensitivity(
-    mode: TenantMode,
-    sensitivity: SensitivityLevel,
-) -> Result<()> {
-    if mode == TenantMode::Personal
-        && matches!(
-            sensitivity,
-            SensitivityLevel::Confidential | SensitivityLevel::Restricted
-        )
-    {
-        return Err(anyhow!(
-            "confidential and restricted sensitivity require enterprise mode"
-        ));
-    }
-    Ok(())
 }
 
 fn parse_kind(value: &str) -> Result<MemoryKind> {

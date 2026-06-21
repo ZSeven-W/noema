@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use uuid::Uuid;
 
-use crate::config::NoemaConfig;
+use crate::config::{NoemaConfig, WritePolicy};
 use crate::error::{NoemaError, Result};
 use crate::hippocampus::Candidate;
 use crate::ids::{CandidateId, MemoryId, ProjectId, TenantId, UserId};
@@ -18,6 +18,7 @@ use crate::store::{read_memory, write_memory};
 pub struct NoemaEngine {
     pub root: PathBuf,
     pub paths: NoemaPaths,
+    config: NoemaConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -57,17 +58,131 @@ pub struct RememberTextRequest {
     pub entities: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SearchRequest {
+    pub principal: Principal,
+    pub query: String,
+    pub cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplainRequest {
+    pub principal: Principal,
+    pub memory_id: String,
+    pub query: String,
+    pub cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RememberRequest {
+    pub principal: Principal,
+    pub text: String,
+    pub scope: Scope,
+    pub project_path: Option<PathBuf>,
+    pub kind: MemoryKind,
+    pub sensitivity: SensitivityLevel,
+    pub tags: Vec<String>,
+    pub entities: Vec<String>,
+    pub confidence: f32,
+    pub importance: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "route")]
+pub enum SubmitOutcome {
+    Queued { candidate_id: String },
+    AutoAccepted { memory_id: String },
+    RejectedSecret,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReviewAction {
+    Accept,
+    Reject {
+        reason: String,
+    },
+    Edit {
+        body: String,
+        reason: String,
+    },
+    Merge {
+        target_memory_id: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewDecisionRequest {
+    pub principal: Principal,
+    pub candidate_id: String,
+    pub action: ReviewAction,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum ReviewOutcome {
+    Accepted { memory_id: String },
+    Rejected,
+    Edited,
+    Merged,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForgetRequest {
+    pub principal: Principal,
+    pub memory_id: String,
+    pub hard: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ForgetOutcome {
+    pub memory_id: String,
+    pub mode: String, // "tombstoned" | "hard-erased"
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PolicyView {
+    pub write: WritePolicy,
+    pub auto_accept_max_sensitivity: SensitivityLevel,
+    pub external_llm_max_sensitivity: SensitivityLevel,
+}
+
+#[derive(Debug, Clone)]
+pub struct PolicySetRequest {
+    pub principal: Principal,
+    pub write: Option<WritePolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StatusView {
+    pub tenant: String,
+    pub user: String,
+    pub mode: String,
+    pub write_policy: WritePolicy,
+    pub ok: bool,
+}
+
 impl NoemaEngine {
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
+        let config = NoemaConfig::load(&root).unwrap_or_default();
         Ok(Self {
             paths: NoemaPaths::new(&root),
             root,
+            config,
         })
     }
 
     pub fn from_config(config: &NoemaConfig) -> Result<Self> {
-        Self::new(&config.storage.local_root)
+        Ok(Self {
+            paths: NoemaPaths::new(&config.storage.local_root),
+            root: config.storage.local_root.clone(),
+            config: config.clone(),
+        })
+    }
+
+    pub fn config(&self) -> &NoemaConfig {
+        &self.config
     }
 
     pub fn init_personal(&self, user: &UserId) -> Result<()> {
@@ -327,6 +442,16 @@ mod tests {
             })
             .unwrap();
         assert_eq!(generous.memories.len(), 1);
+    }
+
+    #[test]
+    fn engine_carries_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = NoemaEngine::new(dir.path()).unwrap();
+        assert_eq!(
+            engine.config().tenant.mode,
+            crate::config::TenantMode::Personal
+        );
     }
 
     #[test]

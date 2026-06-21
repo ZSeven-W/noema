@@ -2205,7 +2205,7 @@ fn locomo_relevant_prompt_clues(
     let mut clues = Vec::new();
     for (memory_index, result) in search_results.iter().take(top_k).enumerate() {
         let memory = result.get("memory").and_then(Value::as_str).unwrap_or("");
-        if is_locomo_fact_summary_memory(&memory) && !memory.contains('\n') {
+        if is_locomo_fact_summary_memory(memory) && !memory.contains('\n') {
             let line = memory.lines().next().unwrap_or("");
             let facts_text = line
                 .strip_prefix("[speaker fact-layer summary]")

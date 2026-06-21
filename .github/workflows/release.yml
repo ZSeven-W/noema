@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy without benchmark suite
+        run: |
+          cargo clippy -p noema-core --lib -- -D warnings
+          cargo clippy -p noema-core --test s3_fake --test enterprise_policy -- -D warnings
+          cargo clippy -p noema --all-targets -- -D warnings
+          cargo clippy -p noema-mcp --all-targets -- -D warnings
+          cargo clippy -p noema-server --all-targets -- -D warnings
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Test workspace without benchmark suite
+        run: |
+          cargo test -p noema-core --lib
+          cargo test -p noema-core --test s3_fake --test enterprise_policy
+          cargo test -p noema
+          cargo test -p noema-mcp
+          cargo test -p noema-server
+
+  build:
+    name: Build release for ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux
+          - os: macos-latest
+            target: macos
+          - os: windows-latest
+            target: windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+
+      - name: Package binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package="noema-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/${package}"
+
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            suffix=".exe"
+          else
+            suffix=""
+          fi
+
+          cp "target/release/noema${suffix}" "dist/${package}/"
+          cp "target/release/noema-mcp${suffix}" "dist/${package}/"
+          cp "target/release/noema-server${suffix}" "dist/${package}/"
+          cp README.md "dist/${package}/"
+
+          tar -czf "dist/${package}.tar.gz" -C dist "${package}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: noema-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/*.tar.gz --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi

@@ -4,7 +4,9 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use crate::api::{NoemaEngine, RecallRequest, RememberTextRequest};
+use crate::api::{
+    NoemaEngine, RecallRequest, RememberRequest, ReviewAction, ReviewDecisionRequest,
+};
 use crate::error::{NoemaError, Result};
 use crate::ids::{MemoryId, TenantId, UserId};
 use crate::memory::{MemoryKind, MemoryRecord, Scope};
@@ -1657,7 +1659,7 @@ fn seed_memories(
             bucket = index % 16
         );
         generated_bytes += body.len();
-        engine.remember_text(RememberTextRequest {
+        engine.submit_candidate(RememberRequest {
             principal: principal.clone(),
             text: body,
             scope: Scope::User,
@@ -1666,7 +1668,17 @@ fn seed_memories(
             sensitivity: SensitivityLevel::Internal,
             tags: vec!["rust".to_string(), "benchmark".to_string()],
             entities: vec!["Noema".to_string(), "zode".to_string()],
+            confidence: 1.0,
+            importance: 0.5,
         })?;
+        let pending = engine.review_list(principal)?;
+        if let Some(first) = pending.first() {
+            engine.review_decide(ReviewDecisionRequest {
+                principal: principal.clone(),
+                candidate_id: first.id.to_string(),
+                action: ReviewAction::Accept,
+            })?;
+        }
     }
     Ok(generated_bytes)
 }

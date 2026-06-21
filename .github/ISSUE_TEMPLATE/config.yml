@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Noema documentation
+    url: https://github.com/ZSeven-W/noema#readme
+    about: Read the project overview, CLI usage, and architecture notes before filing an issue.

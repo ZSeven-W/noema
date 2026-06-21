@@ -1,0 +1,239 @@
+name: Noema issue
+description: Report a bug, request a feature, or document a design problem for Noema.
+title: "[Issue]: "
+labels: ["needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file an issue.
+
+        Noema is early-stage infrastructure for durable agent memory, so short reports are usually not actionable. Please fill out the full template with concrete details, commands, logs, and expected behavior.
+
+  - type: dropdown
+    id: issue_type
+    attributes:
+      label: Issue type
+      description: Pick the closest category.
+      options:
+        - Bug report
+        - Feature request
+        - Design or architecture concern
+        - Documentation issue
+        - Performance or benchmark issue
+        - Security or privacy concern
+        - Question or support request
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: State the issue in one or two precise paragraphs.
+      placeholder: |
+        What happened, what you expected, and why this matters.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and motivation
+      description: Explain what you were trying to do and how this fits into Noema's local-first memory model.
+      placeholder: |
+        I was using Noema for...
+        This matters because...
+        The affected workflow is...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide exact commands, inputs, config, and setup. If this is not reproducible, explain what evidence you have.
+      placeholder: |
+        1. Set up...
+        2. Run `...`
+        3. Observe...
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Describe the behavior or outcome you expected.
+      placeholder: |
+        Noema should...
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Describe what happened instead. Include complete error messages when available.
+      placeholder: |
+        Instead, Noema...
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Affected surface area
+      description: Identify the affected part of the system.
+      placeholder: |
+        CLI command:
+        MCP tool:
+        Core storage/review/recall path:
+        Enterprise server/policy path:
+        Benchmark or LOCOMO path:
+        Documentation section:
+    validations:
+      required: true
+
+  - type: input
+    id: noema_version
+    attributes:
+      label: Noema version or commit
+      description: Paste the release version, git tag, or commit SHA.
+      placeholder: v0.1.0, main@abcdef0, or local checkout commit
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, Rust toolchain, shell, host runtime, and any relevant environment variables.
+      value: |
+        - OS:
+        - Rust version (`rustc --version`):
+        - Cargo version (`cargo --version`):
+        - Shell:
+        - Host runtime (Codex, Claude Code, zode, MCP client, other):
+        - `NOEMA_ROOT`:
+        - Storage backend (local filesystem, fake S3, S3-compatible service):
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: Paste relevant `config.toml`, command flags, policy settings, redacted storage layout, or MCP config.
+      render: toml
+      placeholder: |
+        Paste configuration here. Redact secrets, tokens, credentials, and private memory payloads.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, output, or screenshots
+      description: Paste terminal output, logs, panic traces, JSON responses, or screenshots. Redact secrets and private memory payloads.
+      render: text
+      placeholder: |
+        Paste logs or output here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: data_safety
+    attributes:
+      label: Data sensitivity and privacy impact
+      description: Explain whether public, internal, confidential, restricted, or secret memory could be involved.
+      placeholder: |
+        Does this involve memory payloads, audit logs, deletion manifests, tenant boundaries, ACLs, or sensitivity levels?
+        What has been redacted from this issue?
+    validations:
+      required: true
+
+  - type: textarea
+    id: regression
+    attributes:
+      label: Regression information
+      description: If this used to work, identify the last known good version or commit.
+      placeholder: |
+        Last known good:
+        First known bad:
+        Suspected change:
+    validations:
+      required: true
+
+  - type: textarea
+    id: attempted_workarounds
+    attributes:
+      label: Workarounds tried
+      description: List anything you tried and the result.
+      placeholder: |
+        Tried:
+        Result:
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_solution
+    attributes:
+      label: Proposed solution or acceptance criteria
+      description: For feature/design requests, describe the intended behavior and how maintainers can tell it is complete.
+      placeholder: |
+        A complete fix or feature would...
+        It should not...
+        Acceptance criteria:
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification plan
+      description: Describe commands, tests, or manual checks that should verify the fix.
+      placeholder: |
+        Suggested verification:
+        - `cargo fmt --all -- --check`
+        - `cargo clippy ...`
+        - `cargo test ...`
+        - Manual check:
+    validations:
+      required: true
+
+  - type: textarea
+    id: related
+    attributes:
+      label: Related issues, PRs, discussions, or external references
+      description: Link any relevant context.
+      placeholder: |
+        Related:
+        - #
+        - https://...
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Submission checklist
+      description: Confirm this issue has enough information for triage.
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: I included exact commands, configuration, or inputs needed to understand the issue.
+          required: true
+        - label: I included actual output, logs, or a clear explanation of why none are available.
+          required: true
+        - label: I redacted secrets, credentials, and private memory payloads.
+          required: true
+        - label: I understand incomplete issues may be closed until enough information is provided.
+          required: true

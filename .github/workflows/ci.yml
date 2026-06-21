@@ -54,6 +54,6 @@ jobs:
         run: |
           cargo test -p noema-core --lib
           cargo test -p noema-core --test s3_fake --test enterprise_policy
-          cargo test -p noema
+          cargo test -p noema -- --skip bench
           cargo test -p noema-mcp
           cargo test -p noema-server

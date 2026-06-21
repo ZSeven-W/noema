@@ -119,10 +119,22 @@ impl NoemaTools {
         }
     }
 
-    /// Return the principal for this request.  Stdio transport carries no
-    /// per-request credentials, so we always fall back to the default principal.
-    fn principal_for(&self, _ctx: &RequestContext<RoleServer>) -> Principal {
-        self.default_principal.clone()
+    /// Return the principal for this request.
+    ///
+    /// For the streamable-HTTP transport, rmcp injects `http::request::Parts`
+    /// into the message extensions before routing to the handler, and our auth
+    /// tower layer inserts a `Principal` into those parts' HTTP extensions.
+    /// We walk the chain here:
+    ///   `ctx.extensions` (rmcp) → `http::request::Parts` → `parts.extensions` (http) → `Principal`
+    ///
+    /// For the stdio transport no `Parts` are present, so we fall back to the
+    /// configured default principal unchanged.
+    fn principal_for(&self, ctx: &RequestContext<RoleServer>) -> Principal {
+        ctx.extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<Principal>())
+            .cloned()
+            .unwrap_or_else(|| self.default_principal.clone())
     }
 
     // -----------------------------------------------------------------

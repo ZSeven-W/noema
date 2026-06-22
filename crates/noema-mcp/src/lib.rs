@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use noema_core::api::{
     ExplainRequest, ForgetRequest, NoemaEngine, PolicySetRequest, RememberRequest, ReviewAction,
-    ReviewDecisionRequest, SearchRequest,
+    ReviewDecisionRequest, ReviewOutcome, SearchRequest, SubmitOutcome,
 };
 use noema_core::config::NoemaConfig;
 use noema_core::ids::TenantId;
@@ -49,6 +49,21 @@ pub struct SearchArgs {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
+pub struct RecallGraphArgs {
+    pub query: String,
+    /// How many hops to walk outward from the lexical seeds (default 3).
+    #[serde(default)]
+    pub max_hops: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct NeighborsArgs {
+    pub memory_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct ExplainArgs {
     pub memory_id: String,
     pub query: String,
@@ -62,6 +77,9 @@ pub struct RememberArgs {
     pub tags: Vec<String>,
     #[serde(default)]
     pub entities: Vec<String>,
+    /// Persist explicit memory immediately. Defaults to true for host agents.
+    #[serde(default)]
+    pub accept: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -151,7 +169,6 @@ impl NoemaTools {
         let engine = self.engine.clone();
         let pack = tokio::task::spawn_blocking(move || {
             engine.recall(noema_core::api::RecallRequest {
-                host: principal.host.to_string(),
                 principal: principal.clone(),
                 query: args.query,
                 cwd: None,
@@ -190,6 +207,73 @@ impl NoemaTools {
                     "id": s.id,
                     "score": s.score,
                     "explanation": s.explanation,
+                })
+            })
+            .collect();
+        to_json_str(value)
+    }
+
+    #[tool(
+        description = "Multi-hop recall: lexical seed, then walk links + shared entities outward up to max_hops. Use for questions whose answer spans several connected memories."
+    )]
+    async fn noema_recall_graph(
+        &self,
+        Parameters(args): Parameters<RecallGraphArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        let principal = self.principal_for(&ctx);
+        let engine = self.engine.clone();
+        let max_hops = args.max_hops.unwrap_or(3);
+        let results = tokio::task::spawn_blocking(move || {
+            engine.recall_graph(
+                SearchRequest {
+                    principal,
+                    query: args.query,
+                    cwd: None,
+                },
+                max_hops,
+            )
+        })
+        .await
+        .map_err(internal)?
+        .map_err(domain)?;
+        let value: Vec<serde_json::Value> = results
+            .into_iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "score": s.score,
+                    "explanation": s.explanation,
+                })
+            })
+            .collect();
+        to_json_str(value)
+    }
+
+    #[tool(
+        description = "One graph hop from a memory: the memories it links to or shares an entity with. Step through these for guided multi-hop retrieval."
+    )]
+    async fn noema_neighbors(
+        &self,
+        Parameters(args): Parameters<NeighborsArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        let principal = self.principal_for(&ctx);
+        let engine = self.engine.clone();
+        let neighbors = tokio::task::spawn_blocking(move || {
+            engine.neighbors(&principal, &args.memory_id, None)
+        })
+        .await
+        .map_err(internal)?
+        .map_err(domain)?;
+        let value: Vec<serde_json::Value> = neighbors
+            .into_iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "kind": format!("{:?}", m.kind).to_lowercase(),
+                    "entities": m.entities,
+                    "text": m.body,
                 })
             })
             .collect();
@@ -235,8 +319,8 @@ impl NoemaTools {
         let principal = self.principal_for(&ctx);
         let engine = self.engine.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            engine.submit_candidate(RememberRequest {
-                principal,
+            let outcome = engine.submit_candidate(RememberRequest {
+                principal: principal.clone(),
                 text: args.text,
                 scope: Scope::User,
                 project_path: None,
@@ -246,7 +330,24 @@ impl NoemaTools {
                 entities: args.entities,
                 confidence: 1.0,
                 importance: 0.5,
-            })
+            })?;
+            if !args.accept.unwrap_or(true) {
+                return Ok(serde_json::to_value(outcome)?);
+            }
+            match outcome {
+                SubmitOutcome::Queued { candidate_id } => {
+                    let accepted = engine.review_decide(ReviewDecisionRequest {
+                        principal,
+                        candidate_id,
+                        action: ReviewAction::Accept,
+                    })?;
+                    Ok(serde_json::to_value(accepted)?)
+                }
+                SubmitOutcome::AutoAccepted { memory_id } => {
+                    Ok(serde_json::to_value(ReviewOutcome::Accepted { memory_id })?)
+                }
+                SubmitOutcome::RejectedSecret => Ok(serde_json::to_value(outcome)?),
+            }
         })
         .await
         .map_err(internal)?

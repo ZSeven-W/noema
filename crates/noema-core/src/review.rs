@@ -70,6 +70,35 @@ pub fn has_duplicate_or_conflict(candidate: &Candidate, active_memories: &[Memor
     })
 }
 
+/// Graded novelty in `[0, 1]`: `1.0` when nothing comparable exists, lower as
+/// the candidate's tokens overlap an existing same-scope/kind memory. Feeds the
+/// auto-accept gate so a near-duplicate — one below the hard duplicate
+/// threshold in [`has_duplicate_or_conflict`] — still routes to review instead
+/// of silently accumulating near-identical memories.
+pub fn candidate_novelty(candidate: &Candidate, active_memories: &[MemoryRecord]) -> f32 {
+    let candidate_tokens = tokenize(&candidate.body);
+    if candidate_tokens.is_empty() {
+        return 1.0;
+    }
+    let mut max_overlap = 0.0f32;
+    for memory in active_memories {
+        if memory.scope != candidate.scope
+            || memory.project_id != candidate.project_id
+            || memory.kind != candidate.kind
+        {
+            continue;
+        }
+        let shared = candidate_tokens
+            .intersection(&tokenize(&memory.body))
+            .count();
+        let fraction = shared as f32 / candidate_tokens.len() as f32;
+        if fraction > max_overlap {
+            max_overlap = fraction;
+        }
+    }
+    (1.0 - max_overlap).clamp(0.0, 1.0)
+}
+
 fn has_opposing_assertion(candidate: &str, existing: &str) -> bool {
     let candidate = candidate.to_lowercase();
     let existing = existing.to_lowercase();
@@ -87,13 +116,7 @@ fn has_opposing_assertion(candidate: &str, existing: &str) -> bool {
     })
 }
 
-fn tokenize(text: &str) -> std::collections::HashSet<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|token| token.len() >= 3)
-        .map(ToString::to_string)
-        .collect()
-}
+use crate::text::tokenize;
 
 #[cfg(test)]
 mod tests {
@@ -130,6 +153,32 @@ mod tests {
                 &[]
             ),
             CandidateRoute::RejectSecret
+        );
+    }
+
+    #[test]
+    fn novelty_is_low_for_overlapping_candidate_and_high_for_fresh_one() {
+        let existing = MemoryRecord::new_user_preference(
+            MemoryId::new("mem_existing"),
+            TenantId::new("personal"),
+            UserId::new("kay"),
+            "ripgrep handles searching",
+        );
+        // Shares most of its tokens with an existing memory but is below the hard
+        // duplicate threshold — novelty must still reflect the overlap.
+        let mut overlapping = Candidate::new(CandidateId::new("cand_overlap"), "ripgrep searching");
+        overlapping.kind = MemoryKind::Preference;
+        assert!(
+            candidate_novelty(&overlapping, std::slice::from_ref(&existing)) < 0.5,
+            "overlapping candidate should be low novelty"
+        );
+
+        let mut fresh =
+            Candidate::new(CandidateId::new("cand_fresh"), "kubernetes deployment cron");
+        fresh.kind = MemoryKind::Preference;
+        assert!(
+            candidate_novelty(&fresh, std::slice::from_ref(&existing)) > 0.9,
+            "unrelated candidate should be high novelty"
         );
     }
 

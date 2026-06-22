@@ -66,11 +66,7 @@ impl LexicalIndex {
 }
 
 fn tokens(text: &str) -> HashSet<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|token| token.len() >= 3)
-        .map(ToString::to_string)
-        .collect()
+    crate::text::tokenize(text)
 }
 
 #[cfg(test)]

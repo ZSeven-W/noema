@@ -11,7 +11,6 @@ pub struct RecallRequest {
     pub query: String,
     pub cwd: Option<PathBuf>,
     pub budget_tokens: usize,
-    pub host: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]

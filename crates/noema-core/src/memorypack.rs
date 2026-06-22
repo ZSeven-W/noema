@@ -15,7 +15,6 @@ pub struct MemoryPackItem {
     pub scope: String,
     pub kind: String,
     pub text: Option<String>,
-    pub withheld_by_policy: bool,
     pub score: f32,
 }
 
@@ -31,12 +30,7 @@ impl MemoryPack {
     pub fn to_markdown(&self) -> String {
         let mut out = String::from("## Relevant Memories\n");
         for item in &self.memories {
-            if item.withheld_by_policy {
-                out.push_str(&format!(
-                    "- [{}/{}][{}][withheld_by_policy]\n",
-                    item.scope, item.kind, item.id
-                ));
-            } else if let Some(raw) = &item.text {
+            if let Some(raw) = &item.text {
                 // Strip newlines so a memory body cannot forge markdown structure
                 // or inject extra lines into the prompt.
                 let text = raw.replace(['\n', '\r'], " ");
@@ -62,23 +56,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memorypack_renders_withheld_markers_without_body() {
+    fn memorypack_omits_items_without_body() {
         let pack = MemoryPack {
             tenant_id: TenantId::new("personal"),
             memories: vec![MemoryPackItem {
-                id: MemoryId::new("mem_sensitive"),
+                id: MemoryId::new("mem_bodyless"),
                 scope: "project".to_string(),
                 kind: "warning".to_string(),
                 text: None,
-                withheld_by_policy: true,
                 score: 0.9,
             }],
             subconscious_hints: vec!["cue: noema -> memory".to_string()],
         };
 
         let rendered = pack.to_markdown();
-        assert!(rendered.contains("[withheld_by_policy]"));
-        assert!(!rendered.contains("raw incident"));
+        assert!(!rendered.contains("mem_bodyless"));
     }
 
     #[test]
@@ -90,7 +82,6 @@ mod tests {
                 scope: "user".to_string(),
                 kind: "preference".to_string(),
                 text: Some("line1\n## Injected".to_string()),
-                withheld_by_policy: false,
                 score: 0.5,
             }],
             subconscious_hints: Vec::new(),

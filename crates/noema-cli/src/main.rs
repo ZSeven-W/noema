@@ -3,8 +3,8 @@ mod bench;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use noema_core::api::{
-    ExplainRequest, ForgetRequest, NoemaEngine, RememberRequest, ReviewAction,
-    ReviewDecisionRequest, SearchRequest, SubmitOutcome,
+    ExplainRequest, ForgetRequest, NoemaEngine, RecallRequest, RememberRequest, ReviewAction,
+    ReviewDecisionRequest, ReviewOutcome, SearchRequest, SubmitOutcome,
 };
 use noema_core::config::NoemaConfig;
 use noema_core::memory::{MemoryKind, Scope};
@@ -40,6 +40,14 @@ enum Command {
         confidence: f32,
         #[arg(long, default_value_t = 0.5)]
         importance: f32,
+        /// Persist this explicit memory immediately instead of leaving it in review.
+        #[arg(long)]
+        accept: bool,
+    },
+    Recall {
+        query: String,
+        #[arg(long, default_value_t = 1200)]
+        budget_tokens: usize,
     },
     Review,
     Edit {
@@ -72,6 +80,14 @@ enum Command {
         query: String,
     },
     Vacuum,
+    /// Print the PageIndex catalog (LLM-Wiki index.md) over your memories.
+    Catalog,
+    /// Navigate the catalog for a query and print the memories on matched pages.
+    Browse {
+        query: String,
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+    },
     Sleep {
         #[arg(long)]
         llm: bool,
@@ -129,6 +145,7 @@ fn main() -> Result<()> {
             entities,
             confidence,
             importance,
+            accept,
         } => {
             let outcome = engine.submit_candidate(RememberRequest {
                 principal: principal.clone(),
@@ -143,12 +160,36 @@ fn main() -> Result<()> {
                 importance,
             })?;
             match outcome {
+                SubmitOutcome::Queued { candidate_id } if accept => {
+                    let accepted = engine.review_decide(ReviewDecisionRequest {
+                        principal: principal.clone(),
+                        candidate_id: candidate_id.clone(),
+                        action: ReviewAction::Accept,
+                    })?;
+                    match accepted {
+                        ReviewOutcome::Accepted { memory_id } => println!("accepted {memory_id}"),
+                        other => return Err(anyhow!("unexpected review outcome: {other:?}")),
+                    }
+                }
                 SubmitOutcome::Queued { candidate_id } => println!("queued {candidate_id}"),
                 SubmitOutcome::AutoAccepted { memory_id } => println!("accepted {memory_id}"),
                 SubmitOutcome::RejectedSecret => {
                     return Err(anyhow!("secret candidates are rejected before review"))
                 }
             }
+        }
+        Command::Recall {
+            query,
+            budget_tokens,
+        } => {
+            let cwd = std::env::current_dir().ok();
+            let pack = engine.recall(RecallRequest {
+                principal: principal.clone(),
+                query,
+                cwd,
+                budget_tokens,
+            })?;
+            print!("{}", pack.to_markdown());
         }
         Command::Review => {
             for candidate in engine.review_list(&principal)? {
@@ -225,8 +266,8 @@ fn main() -> Result<()> {
         Command::Vacuum => {
             let tenant = &principal.tenant_id;
             let tenant_dir = engine.paths.tenant_dir(tenant);
-            let _tenant_lock =
-                noema_core::lock::FileLock::exclusive(tenant_dir.join("tenant.lock"))?;
+            // compact_hippocampus acquires tenant.lock itself; locking here too
+            // would self-deadlock (fs4 advisory locks are per-process).
             noema_core::vacuum::compact_hippocampus(&tenant_dir)?;
             let mut event = noema_core::audit::AuditEvent::new(
                 tenant.clone(),
@@ -239,6 +280,17 @@ fn main() -> Result<()> {
             event.reason = None;
             noema_core::audit::append_audit(&tenant_dir, &event)?;
             println!("vacuumed {}", tenant_dir.display());
+        }
+        Command::Catalog => {
+            let cwd = std::env::current_dir().ok();
+            let catalog = engine.catalog(&principal, cwd.as_deref())?;
+            print!("{}", catalog.to_markdown());
+        }
+        Command::Browse { query, limit } => {
+            let cwd = std::env::current_dir().ok();
+            for memory in engine.browse(&principal, &query, limit, cwd.as_deref())? {
+                println!("{} {}", memory.id, memory.body);
+            }
         }
         Command::Sleep { llm } => {
             let tenant = &principal.tenant_id;

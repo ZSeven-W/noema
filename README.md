@@ -108,9 +108,16 @@ If it queues the candidate, accept it from the review queue:
 cargo run -p noema -- accept cand_xxxxx
 ```
 
+For explicit host-agent memory writes that should be available immediately:
+
+```bash
+cargo run -p noema -- remember "Prefer Rust for Noema implementation work." --accept
+```
+
 Search and inspect recall:
 
 ```bash
+cargo run -p noema -- recall "Rust implementation"
 cargo run -p noema -- search "Rust implementation"
 cargo run -p noema -- explain mem_xxxxx --query "Rust implementation"
 ```
@@ -127,12 +134,14 @@ For normal use, omit `NOEMA_ROOT` and Noema will use:
 | --- | --- |
 | `noema init` | Create the local memory layout and config. |
 | `noema remember <text>` | Create a memory candidate. |
+| `noema remember <text> --accept` | Persist an explicit memory immediately. |
 | `noema review` | List pending candidates. |
 | `noema edit <candidate> --body ... --reason ...` | Revise a pending candidate before acceptance. |
 | `noema merge <candidate> <memory> --reason ...` | Drop a duplicate candidate in favor of an existing memory. |
 | `noema accept <candidate>` | Persist a pending candidate as memory. |
 | `noema reject <candidate> --reason ...` | Reject a pending candidate. |
-| `noema search <query>` | Recall matching memories. |
+| `noema recall <query>` | Print a markdown memory pack with full memory text. |
+| `noema search <query>` | Search matching memory ids and scores. |
 | `noema explain <memory> --query ...` | Explain a recall score. |
 | `noema vacuum` | Compact terminal review events into snapshots and archives. |
 | `noema sleep [--llm]` | Move stale or low-utility memory toward deeper storage. |
@@ -242,13 +251,54 @@ enterprise use.
 `noema` is the reference interface and the best place to inspect behavior while
 the project is early.
 
+For host agents that do not use MCP, install the CLI and the bundled skill:
+
+```bash
+cargo install --path crates/noema-cli
+cp -R skills/noema-memory "${CODEX_HOME:-$HOME/.codex}/skills/"
+```
+
+The skill uses:
+
+```bash
+noema recall "<user request>"
+noema remember "<stable fact or preference>" --accept
+```
+
+`recall` prints a markdown memory pack with full memory text for model context.
+`remember --accept` is for explicit host-agent memory writes; plain
+`remember` still follows the review queue policy.
+
 ### MCP
 
 `noema-mcp` exposes a stdio JSON-RPC surface for MCP-capable hosts:
 
 ```bash
-cargo run -p noema-mcp
+cargo install --path crates/noema-mcp
+noema-mcp
 ```
+
+Generic JSON MCP clients can point at the stdio server:
+
+```json
+{
+  "mcpServers": {
+    "noema": {
+      "command": "noema-mcp"
+    }
+  }
+}
+```
+
+Codex-style TOML MCP config can use the same command:
+
+```toml
+[mcp_servers.noema]
+command = "noema-mcp"
+```
+
+The MCP contract is tested end-to-end: tool listing, `noema_remember`, and
+`noema_recall` must round-trip through an isolated Noema root.
 
 ### zode
 

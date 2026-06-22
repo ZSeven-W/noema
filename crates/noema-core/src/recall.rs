@@ -1,8 +1,17 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::ids::ProjectId;
 use crate::memory::{AccessLevel, MemoryRecord, MemoryStatus, RecallMode, Scope};
 use crate::sensitivity::Principal;
+use crate::text;
+
+/// BM25 term-frequency saturation.
+const BM25_K1: f32 = 1.2;
+/// BM25 length-normalization strength.
+const BM25_B: f32 = 0.75;
+/// Maps the unbounded BM25 sum into `[0, 1)` so it composes with the additive
+/// importance / tag / entity boosts below.
+const BM25_SATURATION: f32 = 4.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoredMemory {
@@ -11,58 +20,119 @@ pub struct ScoredMemory {
     pub explanation: Vec<String>,
 }
 
+/// Per-document tokenization plus the corpus statistics BM25 needs (document
+/// frequency and average document length), computed once over the recallable
+/// set so scoring does not re-tokenize every body per query term.
+struct Bm25Corpus {
+    n: f32,
+    avgdl: f32,
+    df: HashMap<String, u32>,
+    docs: Vec<Bm25Doc>,
+}
+
+struct Bm25Doc {
+    counts: HashMap<String, u32>,
+    len: f32,
+}
+
+impl Bm25Corpus {
+    fn build(memories: &[&MemoryRecord]) -> Self {
+        let mut df: HashMap<String, u32> = HashMap::new();
+        let mut docs = Vec::with_capacity(memories.len());
+        let mut total_len: u64 = 0;
+        for memory in memories {
+            let counts = text::term_counts(&memory.body);
+            let len: u32 = counts.values().sum();
+            total_len += len as u64;
+            for token in counts.keys() {
+                *df.entry(token.clone()).or_insert(0) += 1;
+            }
+            docs.push(Bm25Doc {
+                counts,
+                len: len as f32,
+            });
+        }
+        let n = memories.len();
+        let avgdl = if n == 0 {
+            1.0
+        } else {
+            (total_len as f32 / n as f32).max(1.0)
+        };
+        Self {
+            n: n as f32,
+            avgdl,
+            df,
+            docs,
+        }
+    }
+
+    fn idf(&self, token: &str) -> f32 {
+        let df = *self.df.get(token).unwrap_or(&0) as f32;
+        // BM25 idf with +1 inside the log so it stays non-negative even for a
+        // term present in nearly every document.
+        ((self.n - df + 0.5) / (df + 0.5) + 1.0).ln()
+    }
+
+    /// `b` is the length-normalization strength for this document. Compiled
+    /// summary / fact-layer pages pass `b == 0`: their length is curated
+    /// coverage (a rollup of many facts), so penalizing it would push the very
+    /// pages that collapse multi-hop recall below the raw fragments they
+    /// summarize — the opposite of what a wiki-style memory wants.
+    fn term_score(&self, token: &str, tf: f32, doc_len: f32, b: f32) -> f32 {
+        let denom = tf + BM25_K1 * (1.0 - b + b * doc_len / self.avgdl);
+        self.idf(token) * (tf * (BM25_K1 + 1.0)) / denom
+    }
+}
+
 pub fn recall(
     query: &str,
     principal: &Principal,
     project_id: Option<&ProjectId>,
     memories: &[MemoryRecord],
 ) -> Vec<ScoredMemory> {
-    let query_tokens = tokenize(query);
+    let query_tokens = query_tokens_with_aliases(query, principal, project_id, memories);
+
+    let recallable: Vec<&MemoryRecord> = memories
+        .iter()
+        .filter(|memory| is_recallable_by_request(memory, principal, project_id))
+        .collect();
+    let corpus = Bm25Corpus::build(&recallable);
+
     let mut scored = Vec::new();
+    for (memory, doc) in recallable.iter().zip(corpus.docs.iter()) {
+        let entity_tokens = text::tokenize_values(&memory.entities);
 
-    for memory in memories {
-        if memory.tenant_id != principal.tenant_id {
-            continue;
-        }
-        if memory.status != MemoryStatus::Active {
-            continue;
-        }
-        if !is_visible_to_request(memory, principal, project_id) {
-            continue;
-        }
-        if memory.recall_policy.mode == RecallMode::Never {
-            continue;
-        }
-        if !principal.clearance.allows(memory.sensitivity) {
-            continue;
-        }
-        if !memory.recall_policy.allowed_hosts.is_empty()
-            && !memory
-                .recall_policy
-                .allowed_hosts
-                .iter()
-                .any(|host| host == principal.host.as_str())
-        {
-            continue;
+        // BM25 over the body, but skip query terms that are this memory's own
+        // entity tokens — those are credited via entity_overlap so a single
+        // mention is not double-counted (preserves the original semantics).
+        let length_norm = if is_summary_memory(memory) {
+            0.0
+        } else {
+            BM25_B
+        };
+        let mut bm25_sum = 0.0f32;
+        let mut token_overlap = 0usize;
+        for token in &query_tokens {
+            if entity_tokens.contains(token) {
+                continue;
+            }
+            if let Some(&tf) = doc.counts.get(token) {
+                token_overlap += 1;
+                bm25_sum += corpus.term_score(token, tf as f32, doc.len, length_norm);
+            }
         }
 
-        let entity_tokens = tokenize_values(&memory.entities);
-        let body_tokens = tokenize(&memory.body);
-        let overlap = query_tokens
-            .iter()
-            .filter(|token| body_tokens.contains(*token) && !entity_tokens.contains(*token))
-            .count();
-        let tag_tokens = tokenize_values(&memory.tags);
+        let tag_tokens = text::tokenize_values(&memory.tags);
         let tag_overlap = query_tokens.intersection(&tag_tokens).count();
         let entity_overlap = query_tokens.intersection(&entity_tokens).count();
         let project_scope_matches = memory.scope == Scope::Project
             && project_id.is_some()
             && memory.project_id.as_ref() == project_id;
         let project_scope_boost = if project_scope_matches { 0.15 } else { 0.0 };
-        if overlap == 0 && tag_overlap == 0 && entity_overlap == 0 && !project_scope_matches {
+        if token_overlap == 0 && tag_overlap == 0 && entity_overlap == 0 && !project_scope_matches {
             continue;
         }
-        let bm25_norm = overlap as f32 / (overlap as f32 + 3.0);
+        let bm25_norm = bm25_sum / (bm25_sum + BM25_SATURATION);
         let tag_boost = (tag_overlap as f32 * 0.08).min(0.16);
         let entity_boost = (entity_overlap as f32 * 0.06).min(0.12);
         let summary_boost = if entity_overlap > 0 && is_summary_memory(memory) {
@@ -72,25 +142,29 @@ pub fn recall(
         };
         let importance = memory.importance.clamp(0.0, 1.0);
         let confidence = memory.confidence.clamp(0.0, 1.0);
+        let recency_boost = recency_boost(memory);
         let score = bm25_norm * 0.58
             + importance * 0.15
             + confidence * 0.08
             + tag_boost
             + entity_boost
             + summary_boost
-            + project_scope_boost;
+            + project_scope_boost
+            + recency_boost;
         scored.push(ScoredMemory {
             id: memory.id.to_string(),
             score,
             explanation: vec![
-                format!("token_overlap={overlap}"),
+                format!("token_overlap={token_overlap}"),
                 format!("tag_overlap={tag_overlap}"),
                 format!("entity_overlap={entity_overlap}"),
+                format!("bm25={bm25_sum:.3}"),
                 format!("bm25_norm={bm25_norm:.3}"),
                 format!("importance={importance:.3}"),
                 format!("confidence={confidence:.3}"),
                 format!("summary_boost={summary_boost:.3}"),
                 format!("project_scope_boost={project_scope_boost:.3}"),
+                format!("recency_boost={recency_boost:.3}"),
             ],
         });
     }
@@ -101,6 +175,70 @@ pub fn recall(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     scored
+}
+
+/// A small boost for memories actually used recently, decaying linearly over
+/// ~30 days. Surfaces the "live" memory among lexical ties without overriding
+/// genuine relevance (kept well below the BM25 weight). Depends on the engine
+/// bumping `last_used_at` when a memory is served — see `NoemaEngine::recall`.
+fn recency_boost(memory: &MemoryRecord) -> f32 {
+    let Some(last_used) = memory.last_used_at else {
+        return 0.0;
+    };
+    let age_days = (time::OffsetDateTime::now_utc() - last_used)
+        .whole_days()
+        .max(0) as f32;
+    (0.06 * (1.0 - age_days / 30.0)).max(0.0)
+}
+
+fn query_tokens_with_aliases(
+    query: &str,
+    principal: &Principal,
+    project_id: Option<&ProjectId>,
+    memories: &[MemoryRecord],
+) -> HashSet<String> {
+    let mut tokens = text::tokenize(query);
+    for _ in 0..3 {
+        let mut changed = false;
+        for memory in memories {
+            if !is_recallable_by_request(memory, principal, project_id) {
+                continue;
+            }
+            for (left, right) in extract_alias_pairs(&memory.body) {
+                if alias_side_matches_query(query, &tokens, right) {
+                    changed |= extend_tokens(&mut tokens, left);
+                }
+                if alias_side_matches_query(query, &tokens, left) {
+                    changed |= extend_tokens(&mut tokens, right);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    tokens
+}
+
+/// Whether a memory may be recalled by this request (tenant, status, visibility,
+/// recall policy, clearance, host). Exposed so the multi-hop graph walk builds
+/// its adjacency over exactly the same recallable set as lexical recall.
+pub fn is_recallable_by_request(
+    memory: &MemoryRecord,
+    principal: &Principal,
+    project_id: Option<&ProjectId>,
+) -> bool {
+    memory.tenant_id == principal.tenant_id
+        && memory.status == MemoryStatus::Active
+        && is_visible_to_request(memory, principal, project_id)
+        && memory.recall_policy.mode != RecallMode::Never
+        && principal.clearance.allows(memory.sensitivity)
+        && (memory.recall_policy.allowed_hosts.is_empty()
+            || memory
+                .recall_policy
+                .allowed_hosts
+                .iter()
+                .any(|host| host == principal.host.as_str()))
 }
 
 fn is_visible_to_request(
@@ -143,106 +281,63 @@ fn is_summary_memory(memory: &MemoryRecord) -> bool {
         .any(|tag| tag == "summary" || tag == "fact-layer" || tag == "episode")
 }
 
-fn tokenize(text: &str) -> HashSet<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|token| token.len() >= 3)
-        .filter(|token| !is_stopword(token))
-        .map(ToString::to_string)
-        .collect()
+fn extract_alias_pairs(text: &str) -> Vec<(&str, &str)> {
+    let mut pairs = Vec::new();
+    for marker in [
+        "也就是",
+        "就是",
+        "也叫",
+        "又叫",
+        "叫做",
+        "叫",
+        " aka ",
+        " AKA ",
+        "=",
+    ] {
+        if let Some((left, right)) = text.split_once(marker) {
+            let left = cleanup_alias_side(left);
+            let right = cleanup_alias_side(right);
+            if is_valid_alias_side(left) && is_valid_alias_side(right) {
+                pairs.push((left, right));
+            }
+        }
+    }
+    pairs
 }
 
-fn tokenize_values(values: &[String]) -> HashSet<String> {
-    values.iter().flat_map(|value| tokenize(value)).collect()
+fn cleanup_alias_side(input: &str) -> &str {
+    input
+        .trim()
+        .trim_matches(['"', '\'', '“', '”', '‘', '’'])
+        .trim_matches([
+            ' ', '\t', '\n', '\r', '。', '，', ',', '.', '；', ';', ':', '：',
+        ])
+        .trim()
 }
 
-fn is_stopword(token: &str) -> bool {
-    matches!(
-        token,
-        "about"
-            | "after"
-            | "again"
-            | "all"
-            | "also"
-            | "and"
-            | "any"
-            | "are"
-            | "because"
-            | "been"
-            | "before"
-            | "being"
-            | "both"
-            | "but"
-            | "can"
-            | "could"
-            | "did"
-            | "does"
-            | "during"
-            | "each"
-            | "few"
-            | "for"
-            | "from"
-            | "had"
-            | "has"
-            | "have"
-            | "her"
-            | "here"
-            | "hers"
-            | "him"
-            | "his"
-            | "how"
-            | "into"
-            | "its"
-            | "just"
-            | "more"
-            | "most"
-            | "nor"
-            | "not"
-            | "now"
-            | "off"
-            | "once"
-            | "only"
-            | "other"
-            | "our"
-            | "ours"
-            | "out"
-            | "over"
-            | "own"
-            | "same"
-            | "she"
-            | "should"
-            | "some"
-            | "such"
-            | "than"
-            | "that"
-            | "the"
-            | "their"
-            | "theirs"
-            | "them"
-            | "then"
-            | "there"
-            | "they"
-            | "this"
-            | "through"
-            | "too"
-            | "under"
-            | "until"
-            | "very"
-            | "was"
-            | "were"
-            | "what"
-            | "when"
-            | "where"
-            | "which"
-            | "who"
-            | "whom"
-            | "why"
-            | "will"
-            | "with"
-            | "you"
-            | "your"
-            | "yours"
-    )
+fn is_valid_alias_side(input: &str) -> bool {
+    let chars = input.chars().count();
+    (2..=32).contains(&chars)
+        && !input.contains('？')
+        && !input.contains('?')
+        && !["什么", "怎么", "如何", "为什么", "哪里", "哪位"]
+            .iter()
+            .any(|marker| input.contains(marker))
+}
+
+fn alias_side_matches_query(query: &str, query_tokens: &HashSet<String>, side: &str) -> bool {
+    query.contains(side)
+        || crate::text::tokenize(side)
+            .iter()
+            .any(|token| query_tokens.contains(token))
+}
+
+fn extend_tokens(tokens: &mut HashSet<String>, text: &str) -> bool {
+    let mut changed = false;
+    for token in crate::text::tokenize(text) {
+        changed |= tokens.insert(token);
+    }
+    changed
 }
 
 pub fn explain_memory(
@@ -307,6 +402,45 @@ mod tests {
             .explanation
             .iter()
             .any(|line| line.contains("token")));
+    }
+
+    #[test]
+    fn recall_matches_cjk_preference_questions() {
+        let principal = Principal::personal("kay", "zode");
+        let memory = MemoryRecord::new_user_preference(
+            MemoryId::new("mem_cjk"),
+            TenantId::new("personal"),
+            UserId::new("kay"),
+            "王小明爱吃酸的",
+        );
+
+        let results = recall("王小明爱吃什么", &principal, None, &[memory]);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "mem_cjk");
+        assert!(results[0].score > 0.0);
+    }
+
+    #[test]
+    fn recall_expands_cjk_aliases_for_related_memories() {
+        let principal = Principal::personal("kay", "zode");
+        let alias = MemoryRecord::new_user_preference(
+            MemoryId::new("mem_alias"),
+            TenantId::new("personal"),
+            UserId::new("kay"),
+            "老李就是李小红",
+        );
+        let hobby = MemoryRecord::new_user_preference(
+            MemoryId::new("mem_hobby"),
+            TenantId::new("personal"),
+            UserId::new("kay"),
+            "老李爱健身",
+        );
+
+        let results = recall("李小红的爱好", &principal, None, &[alias, hobby]);
+
+        assert!(results.iter().any(|result| result.id == "mem_alias"));
+        assert!(results.iter().any(|result| result.id == "mem_hobby"));
     }
 
     #[test]
@@ -523,6 +657,80 @@ mod tests {
 
         let results = recall("noema rust review", &principal, None, &[memory]);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn recall_matches_across_word_inflections() {
+        let principal = Principal::personal("kay", "zode");
+        let memory = MemoryRecord::new_user_preference(
+            MemoryId::new("mem_infl"),
+            TenantId::new("personal"),
+            UserId::new("kay"),
+            "Prefer ripgrep when searching.",
+        );
+        // The query says "search"; the body says "searching" — with no stemming
+        // these never overlap and the memory is filtered out entirely.
+        let results = recall("search tool", &principal, None, &[memory]);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert!(results[0].score > 0.0);
+    }
+
+    #[test]
+    fn recall_prefers_recently_used_memory_among_ties() {
+        use time::{Duration, OffsetDateTime};
+        let principal = Principal::personal("kay", "zode");
+        let make = |id: &str| {
+            MemoryRecord::new_user_preference(
+                MemoryId::new(id),
+                TenantId::new("personal"),
+                UserId::new("kay"),
+                "Use Rust for the Noema memory system.",
+            )
+        };
+        let cold = make("mem_cold");
+        let mut warm = make("mem_warm");
+        warm.last_used_at = Some(OffsetDateTime::now_utc() - Duration::hours(1));
+
+        let results = recall("rust memory", &principal, None, &[cold, warm]);
+        // Otherwise-identical memories tie on BM25; the recently-used one must
+        // win so the "live" memory surfaces first.
+        assert_eq!(results[0].id, "mem_warm", "{results:?}");
+    }
+
+    #[test]
+    fn recall_ranks_rare_term_match_above_common_term_match() {
+        let principal = Principal::personal("kay", "zode");
+        let mut memories = Vec::new();
+        // Make "rust" a common term across the corpus (high document frequency).
+        for i in 0..8 {
+            memories.push(MemoryRecord::new_user_preference(
+                MemoryId::new(format!("mem_filler_{i}")),
+                TenantId::new("personal"),
+                UserId::new("kay"),
+                "rust",
+            ));
+        }
+        // One memory matches only the common term, one only the rare term.
+        memories.push(MemoryRecord::new_user_preference(
+            MemoryId::new("mem_common"),
+            TenantId::new("personal"),
+            UserId::new("kay"),
+            "rust",
+        ));
+        memories.push(MemoryRecord::new_user_preference(
+            MemoryId::new("mem_rare"),
+            TenantId::new("personal"),
+            UserId::new("kay"),
+            "kubernetes",
+        ));
+
+        let results = recall("rust kubernetes", &principal, None, &memories);
+        let score_of = |id: &str| results.iter().find(|r| r.id == id).map(|r| r.score);
+        let rare = score_of("mem_rare").expect("rare memory recalled");
+        let common = score_of("mem_common").expect("common memory recalled");
+        // IDF must make the single rare-term match outrank the single common-term
+        // match; a plain overlap count ties them (both match one query term).
+        assert!(rare > common, "rare={rare} common={common}");
     }
 
     #[test]

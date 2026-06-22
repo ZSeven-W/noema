@@ -36,7 +36,6 @@ pub fn run_recall_benchmark(
                 query: query.clone(),
                 cwd: None,
                 budget_tokens: 1200,
-                host: "noema-bench".to_string(),
             })?;
             std::hint::black_box(profiled.pack.memories.len());
             Ok(recall_phase_measurements(&profiled.timings))
@@ -56,7 +55,6 @@ pub fn run_recall_benchmark(
                 query: query.clone(),
                 cwd: None,
                 budget_tokens: 1200,
-                host: "zode".to_string(),
             })?;
             let render_start = Instant::now();
             let rendered = profiled.pack.to_markdown();

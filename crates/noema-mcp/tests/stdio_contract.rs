@@ -4,7 +4,9 @@ use noema_core::api::NoemaEngine;
 use noema_core::config::NoemaConfig;
 use noema_core::ids::UserId;
 use noema_mcp::{personal_principal, NoemaTools};
+use rmcp::model::{CallToolRequestParams, JsonObject};
 use rmcp::ServiceExt;
+use serde_json::json;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lists_tools_and_recalls() {
@@ -45,7 +47,37 @@ async fn lists_tools_and_recalls() {
         "expected noema_review_decide in tool list, got: {names:?}"
     );
 
+    let mut remember_args = JsonObject::new();
+    remember_args.insert("text".to_string(), json!("老李爱健身"));
+    let remembered = client
+        .call_tool(CallToolRequestParams::new("noema_remember").with_arguments(remember_args))
+        .await
+        .unwrap();
+    let remembered_text = tool_text(&remembered);
+    assert!(
+        remembered_text.contains("memory_id"),
+        "expected accepted memory id, got: {remembered_text}"
+    );
+
+    let mut recall_args = JsonObject::new();
+    recall_args.insert("query".to_string(), json!("老李爱做什么"));
+    let recalled = client
+        .call_tool(CallToolRequestParams::new("noema_recall").with_arguments(recall_args))
+        .await
+        .unwrap();
+    let recalled_text = tool_text(&recalled);
+    assert!(recalled_text.contains("老李爱健身"), "{recalled_text}");
+
     // Clean shutdown.
     client.cancel().await.ok();
     server.cancel().await.ok();
+}
+
+fn tool_text(result: &rmcp::model::CallToolResult) -> &str {
+    result
+        .content
+        .first()
+        .and_then(|content| content.raw.as_text())
+        .map(|text| text.text.as_str())
+        .expect("expected text tool content")
 }

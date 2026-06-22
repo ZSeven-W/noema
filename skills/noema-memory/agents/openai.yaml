@@ -1,0 +1,4 @@
+interface:
+  display_name: "Noema Memory"
+  short_description: "Cross-session memory via Noema CLI."
+  default_prompt: "Use Noema memory for this task."

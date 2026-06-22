@@ -39,6 +39,32 @@ fn remember_routes_to_review_queue() {
 }
 
 #[test]
+fn explicit_remember_accept_and_recall_outputs_memory_pack() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::cargo_bin("noema")
+        .unwrap()
+        .env("NOEMA_ROOT", dir.path())
+        .arg("init")
+        .assert()
+        .success();
+    Command::cargo_bin("noema")
+        .unwrap()
+        .env("NOEMA_ROOT", dir.path())
+        .args(["remember", "老李爱健身", "--accept"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("accepted"));
+    Command::cargo_bin("noema")
+        .unwrap()
+        .env("NOEMA_ROOT", dir.path())
+        .args(["recall", "老李爱做什么"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("## Relevant Memories"))
+        .stdout(predicate::str::contains("老李爱健身"));
+}
+
+#[test]
 fn personal_mode_rejects_confidential_memory() {
     let dir = tempfile::tempdir().unwrap();
     Command::cargo_bin("noema")

@@ -171,6 +171,26 @@ For normal use, omit `NOEMA_ROOT` and Noema will use:
 | `noema doctor` | Check local store health. |
 | `noema reindex` | Rebuild local indexes. |
 
+## Recall Paths
+
+Noema exposes several deterministic recall paths:
+
+- `recall`: default agent context injection. It uses Fusion Recall: lexical BM25,
+  PageIndex entity/topic browsing, graph expansion, usage recency, and diversity
+  limits.
+- `search`: diagnostic lexical recall. Use it when you need reproducible BM25
+  score explanations without associative expansion.
+- `browse`: PageIndex navigation. Use it when a query names an entity, topic, or
+  project and related memories may not share the same words as the query.
+- `recall_graph`: deterministic multi-hop recall from lexical seeds through
+  links and shared entities.
+- `neighbors`: one-hop graph inspection for agent-driven memory exploration.
+
+The default agent path should call `recall` first. If the answer depends on a
+person, project, or topic profile, hosts should call `browse` or `catalog`
+before asking the model to answer. If the answer spans several connected
+memories, hosts should call `recall_graph` or step through `neighbors`.
+
 ## Storage Model
 
 Noema keeps storage boring on purpose. The hot path is made of directories,

@@ -12,6 +12,7 @@ mod locomo;
 mod memory;
 mod pipeline;
 mod prompt;
+mod quality;
 mod recall_bench;
 mod score;
 mod token;
@@ -34,6 +35,8 @@ pub use pipeline::{
     locomo_retry_judge_tasks_jsonl_from_results, locomo_run_report_json_from_artifacts,
     locomo_run_report_json_from_artifacts_with_host_manifest, locomo_status_json_from_results,
 };
+
+pub use quality::{mrr_ids, recall_at_k_ids};
 
 pub use recall_bench::run_recall_benchmark;
 

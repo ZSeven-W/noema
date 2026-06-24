@@ -1848,3 +1848,24 @@ fn locomo_retry_judge_tasks_jsonl_exports_missing_and_malformed_judges() {
         .unwrap()
         .contains("Gold answer: Lisbon."));
 }
+
+#[test]
+fn recall_quality_metrics_measure_top_k_and_mrr() {
+    let results = vec![
+        "mem_a".to_string(),
+        "mem_noise".to_string(),
+        "mem_b".to_string(),
+        "mem_c".to_string(),
+    ];
+    let relevant = vec!["mem_a".to_string(), "mem_b".to_string()];
+
+    assert_eq!(
+        noema_core::benchmark::recall_at_k_ids(&results, &relevant, 1),
+        0.5
+    );
+    assert_eq!(
+        noema_core::benchmark::recall_at_k_ids(&results, &relevant, 3),
+        1.0
+    );
+    assert_eq!(noema_core::benchmark::mrr_ids(&results, &relevant), 1.0);
+}

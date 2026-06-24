@@ -15,6 +15,7 @@ pub mod crypto;
 pub mod error;
 pub mod extraction;
 pub mod frontmatter;
+pub mod fusion;
 pub mod hippocampus;
 pub mod identity;
 pub mod ids;

@@ -98,6 +98,41 @@ fn engine_recall_enforces_budget_tokens() {
 }
 
 #[test]
+fn engine_recall_uses_fusion_pageindex_associations() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = NoemaEngine::new(dir.path()).unwrap();
+    let principal = Principal::personal("kay", "zode");
+    engine.init_personal(&UserId::new("kay")).unwrap();
+    seed_memory(
+        &engine,
+        &principal,
+        "Melanie's favorite book is Charlotte's Web.",
+        vec![],
+        vec!["Melanie".to_string()],
+    );
+    seed_memory(
+        &engine,
+        &principal,
+        "Melanie enjoys pottery on weekends.",
+        vec![],
+        vec!["Melanie".to_string()],
+    );
+
+    let pack = engine
+        .recall(RecallRequest {
+            principal,
+            query: "What else is connected to Charlotte's Web?".to_string(),
+            cwd: None,
+            budget_tokens: 1200,
+        })
+        .unwrap();
+    let rendered = pack.to_markdown();
+
+    assert!(rendered.contains("Charlotte's Web"), "{rendered}");
+    assert!(rendered.contains("pottery"), "{rendered}");
+}
+
+#[test]
 fn engine_carries_config() {
     let dir = tempfile::tempdir().unwrap();
     let engine = NoemaEngine::new(dir.path()).unwrap();

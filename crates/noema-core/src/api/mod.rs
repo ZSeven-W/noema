@@ -20,7 +20,6 @@ use crate::memorypack::{MemoryPack, MemoryPackItem};
 use crate::pageindex::PageIndex;
 use crate::paths::NoemaPaths;
 use crate::project::project_id_from_path;
-use crate::recall::recall;
 use crate::review::{route_candidate, CandidateRoute};
 use crate::sensitivity::{Principal, SensitivityLevel};
 use crate::store::{read_memory, write_memory};
@@ -112,11 +111,12 @@ impl NoemaEngine {
         let load_memories_us = elapsed_us(load_start);
 
         let score_start = Instant::now();
-        let scored = recall(
+        let scored = crate::fusion::fusion_recall(
             &request.query,
             &request.principal,
             project.as_ref(),
             &memories,
+            crate::fusion::FusionOptions::default(),
         );
         let score_memories_us = elapsed_us(score_start);
         let scored_memories = scored.len();

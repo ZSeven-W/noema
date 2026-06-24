@@ -49,6 +49,14 @@ pub struct SearchArgs {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
+pub struct BrowseArgs {
+    pub query: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct RecallGraphArgs {
     pub query: String,
     /// How many hops to walk outward from the lexical seeds (default 3).
@@ -211,6 +219,49 @@ impl NoemaTools {
             })
             .collect();
         to_json_str(value)
+    }
+
+    #[tool(description = "Browse the PageIndex catalog for entity/topic-associated memories")]
+    async fn noema_browse(
+        &self,
+        Parameters(args): Parameters<BrowseArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        let principal = self.principal_for(&ctx);
+        let engine = self.engine.clone();
+        let memories = tokio::task::spawn_blocking(move || {
+            engine.browse(&principal, &args.query, args.limit.unwrap_or(8), None)
+        })
+        .await
+        .map_err(internal)?
+        .map_err(domain)?;
+        let value: Vec<serde_json::Value> = memories
+            .into_iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "kind": format!("{:?}", m.kind).to_lowercase(),
+                    "entities": m.entities,
+                    "text": m.body,
+                })
+            })
+            .collect();
+        to_json_str(value)
+    }
+
+    #[tool(description = "Render the PageIndex memory catalog as markdown")]
+    async fn noema_catalog(&self, ctx: RequestContext<RoleServer>) -> ToolResult {
+        let principal = self.principal_for(&ctx);
+        let engine = self.engine.clone();
+        let markdown = tokio::task::spawn_blocking(move || {
+            engine
+                .catalog(&principal, None)
+                .map(|catalog| catalog.to_markdown())
+        })
+        .await
+        .map_err(internal)?
+        .map_err(domain)?;
+        Ok(markdown)
     }
 
     #[tool(

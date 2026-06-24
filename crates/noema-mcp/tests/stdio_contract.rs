@@ -46,9 +46,18 @@ async fn lists_tools_and_recalls() {
         names.iter().any(|n| n == "noema_review_decide"),
         "expected noema_review_decide in tool list, got: {names:?}"
     );
+    assert!(
+        names.iter().any(|n| n == "noema_browse"),
+        "expected noema_browse in tool list, got: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "noema_catalog"),
+        "expected noema_catalog in tool list, got: {names:?}"
+    );
 
     let mut remember_args = JsonObject::new();
     remember_args.insert("text".to_string(), json!("老李爱健身"));
+    remember_args.insert("entities".to_string(), json!(["老李"]));
     let remembered = client
         .call_tool(CallToolRequestParams::new("noema_remember").with_arguments(remember_args))
         .await
@@ -67,6 +76,33 @@ async fn lists_tools_and_recalls() {
         .unwrap();
     let recalled_text = tool_text(&recalled);
     assert!(recalled_text.contains("老李爱健身"), "{recalled_text}");
+
+    let mut second_remember_args = JsonObject::new();
+    second_remember_args.insert("text".to_string(), json!("老李喜欢酸梅汤"));
+    second_remember_args.insert("entities".to_string(), json!(["老李"]));
+    client
+        .call_tool(
+            CallToolRequestParams::new("noema_remember").with_arguments(second_remember_args),
+        )
+        .await
+        .unwrap();
+
+    let mut browse_args = JsonObject::new();
+    browse_args.insert("query".to_string(), json!("老李喜欢什么"));
+    let browsed = client
+        .call_tool(CallToolRequestParams::new("noema_browse").with_arguments(browse_args))
+        .await
+        .unwrap();
+    let browsed_text = tool_text(&browsed);
+    assert!(browsed_text.contains("老李爱健身"), "{browsed_text}");
+    assert!(browsed_text.contains("老李喜欢酸梅汤"), "{browsed_text}");
+
+    let cataloged = client
+        .call_tool(CallToolRequestParams::new("noema_catalog"))
+        .await
+        .unwrap();
+    let cataloged_text = tool_text(&cataloged);
+    assert!(cataloged_text.contains("老李"), "{cataloged_text}");
 
     // Clean shutdown.
     client.cancel().await.ok();

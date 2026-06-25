@@ -281,7 +281,7 @@ fn is_summary_memory(memory: &MemoryRecord) -> bool {
         .any(|tag| tag == "summary" || tag == "fact-layer" || tag == "episode")
 }
 
-fn extract_alias_pairs(text: &str) -> Vec<(&str, &str)> {
+pub(crate) fn extract_alias_pairs(text: &str) -> Vec<(&str, &str)> {
     let mut pairs = Vec::new();
     for marker in [
         "也就是",

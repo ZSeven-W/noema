@@ -148,7 +148,35 @@ fn neighbor_ids(
             }
         }
     }
+    for other in recallable {
+        if other.id == memory.id {
+            continue;
+        }
+        if shares_alias(memory, other) {
+            out.push(other.id.to_string());
+        }
+    }
     out
+}
+
+fn shares_alias(left: &MemoryRecord, right: &MemoryRecord) -> bool {
+    alias_pair_connects(left, right) || alias_pair_connects(right, left)
+}
+
+fn alias_pair_connects(alias_memory: &MemoryRecord, other: &MemoryRecord) -> bool {
+    crate::recall::extract_alias_pairs(&alias_memory.body)
+        .into_iter()
+        .any(|(alias_left, alias_right)| {
+            mentions_alias_side(other, alias_left) || mentions_alias_side(other, alias_right)
+        })
+}
+
+fn mentions_alias_side(memory: &MemoryRecord, side: &str) -> bool {
+    memory.body.contains(side)
+        || memory
+            .entities
+            .iter()
+            .any(|entity| entity.eq_ignore_ascii_case(side))
 }
 
 #[cfg(test)]
@@ -208,5 +236,19 @@ mod tests {
         let b = mem("mem_b", "fzf is a fuzzy finder");
         let results = recall_multihop("ripgrep", &principal, None, &[a, b], 0);
         assert!(results.iter().all(|r| r.id != "mem_b"));
+    }
+
+    #[test]
+    fn multihop_follows_alias_edges_between_cjk_name_variants() {
+        let principal = Principal::personal("kay", "zode");
+        let alias = mem("mem_alias", "老杨就是杨晋飞");
+        let hobby = mem("mem_hobby", "老杨爱打羽毛球");
+
+        let results = recall_multihop("杨晋飞爱做什么", &principal, None, &[alias, hobby], 2);
+
+        assert!(
+            results.iter().any(|result| result.id == "mem_hobby"),
+            "{results:?}"
+        );
     }
 }

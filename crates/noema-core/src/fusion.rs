@@ -256,6 +256,25 @@ mod tests {
     }
 
     #[test]
+    fn fusion_bridges_cjk_alias_forward_query() {
+        // Repro of the user report: alias + a fact about one name variant; the
+        // forward query uses the OTHER variant. The full fusion path (lexical +
+        // pageindex + multihop) must surface the fact via the alias bridge.
+        let principal = Principal::personal("kay", "zode");
+        let alias = mem("mem_alias", "老杨就是杨晋飞", &[], &[]);
+        let hobby = mem("mem_hobby", "老杨爱健身", &[], &[]);
+        let results = fusion_recall(
+            "杨晋飞爱做什么",
+            &principal,
+            None,
+            &[alias, hobby],
+            FusionOptions::default(),
+        );
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"mem_hobby"), "alias bridge failed: {results:?}");
+    }
+
+    #[test]
     fn fusion_limits_memories_per_entity_for_diversity() {
         let principal = Principal::personal("kay", "zode");
         let memories = vec![

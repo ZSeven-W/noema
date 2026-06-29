@@ -63,13 +63,14 @@ fn for_each_token(text: &str, mut sink: impl FnMut(String)) {
 /// English path so they get stopword + stemmer treatment.
 fn push_cjk_segment(segment: &str, sink: &mut impl FnMut(String)) {
     for piece in jieba().cut_for_search(segment, true) {
-        if piece.chars().any(is_cjk) {
-            if piece.chars().count() == 1 && is_cjk_stopword(piece) {
+        let word = piece.word;
+        if word.chars().any(is_cjk) {
+            if word.chars().count() == 1 && is_cjk_stopword(word) {
                 continue;
             }
-            sink(piece.to_string());
+            sink(word.to_string());
         } else {
-            push_word_token(piece, sink);
+            push_word_token(word, sink);
         }
     }
 }

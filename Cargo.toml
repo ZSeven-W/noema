@@ -22,7 +22,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 fs4 = "0.8"
 hmac = "0.12"
-jieba-rs = "0.7"
+jieba-rs = "0.10.1"
 jsonwebtoken = "9"
 rust-stemmers = "1"
 predicates = "3"

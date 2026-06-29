@@ -271,7 +271,10 @@ mod tests {
             FusionOptions::default(),
         );
         let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
-        assert!(ids.contains(&"mem_hobby"), "alias bridge failed: {results:?}");
+        assert!(
+            ids.contains(&"mem_hobby"),
+            "alias bridge failed: {results:?}"
+        );
     }
 
     #[test]

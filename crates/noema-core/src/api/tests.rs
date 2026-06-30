@@ -263,6 +263,171 @@ fn policy_set_takes_effect_on_same_engine_and_disk() {
 }
 
 #[test]
+fn auto_accept_supersedes_conflicting_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = NoemaEngine::new(dir.path()).unwrap();
+    let principal = Principal::personal("kay", "zode");
+    engine.init_personal(&UserId::new("kay")).unwrap();
+
+    // Seed an accepted preference under the default Review policy ("use ripgrep").
+    seed_memory(
+        &engine,
+        &principal,
+        "Use ripgrep for search.",
+        vec![],
+        vec!["ripgrep".to_string()],
+    );
+
+    // Now switch to AutoSafe for the contradicting submission.
+    engine
+        .policy_set(PolicySetRequest {
+            principal: principal.clone(),
+            write: Some(crate::config::WritePolicy::AutoSafe),
+        })
+        .unwrap();
+
+    // A CONTRADICTING preference ("avoid ripgrep") must ROUTE TO REVIEW, not
+    // auto-accept — route_candidate sends conflicts to the inbox so a human
+    // confirms the flip. (This is the correct, safe behavior.)
+    let outcome = engine
+        .submit_candidate(RememberRequest {
+            principal: principal.clone(),
+            text: "Avoid ripgrep for search.".to_string(),
+            scope: crate::memory::Scope::User,
+            project_path: None,
+            kind: crate::memory::MemoryKind::Preference,
+            sensitivity: crate::sensitivity::SensitivityLevel::Internal,
+            tags: vec![],
+            entities: vec!["ripgrep".to_string()],
+            confidence: 0.95,
+            importance: 0.7,
+        })
+        .unwrap();
+    let cand_id = match outcome {
+        SubmitOutcome::Queued { candidate_id } => candidate_id,
+        other => panic!("conflict should queue for review, got {other:?}"),
+    };
+
+    // Accepting the queued contradiction supersedes the old memory.
+    let new_id = match engine
+        .review_decide(ReviewDecisionRequest {
+            principal: principal.clone(),
+            candidate_id: cand_id,
+            action: ReviewAction::Accept,
+        })
+        .unwrap()
+    {
+        ReviewOutcome::Accepted { memory_id } => memory_id,
+        other => panic!("expected accepted, got {other:?}"),
+    };
+
+    // Recall must return ONLY the new memory; the superseded one is tombstoned.
+    let pack = engine
+        .recall(RecallRequest {
+            principal: principal.clone(),
+            query: "ripgrep search".to_string(),
+            cwd: None,
+            budget_tokens: 1200,
+        })
+        .unwrap();
+    assert_eq!(
+        pack.memories.len(),
+        1,
+        "only the new memory recalls: {pack:?}"
+    );
+    assert!(pack.memories[0]
+        .text
+        .as_deref()
+        .is_some_and(|t| t.contains("Avoid")));
+
+    // The new memory carries a `supersedes` link to the old one.
+    let new_path = engine
+        .paths
+        .user_cortex_dir(&principal.tenant_id, &principal.user_id)
+        .join(format!("{new_id}.md"));
+    let new_rec = crate::store::read_memory(&new_path).unwrap();
+    assert!(
+        new_rec.links.iter().any(|l| l.rel == "supersedes"),
+        "new memory should record a supersedes link: {:?}",
+        new_rec.links
+    );
+}
+
+#[test]
+fn supersede_does_not_tombstone_another_users_memory() {
+    use crate::ids::MemoryId;
+    use crate::memory::{Scope, Visibility};
+    use crate::project::project_id_from_path;
+    use crate::store::write_memory;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = NoemaEngine::new(dir.path()).unwrap();
+    engine.init_personal(&UserId::new("kay")).unwrap();
+
+    // The candidate's project_id is DERIVED from its project_path — seed the
+    // foreign memory under that exact id so it lands in the active corpus the
+    // accept path scans (otherwise the ACL gate wouldn't even be exercised).
+    let project_path = dir.path().join("git_shared");
+    std::fs::create_dir_all(&project_path).unwrap();
+    let project = project_id_from_path(&project_path);
+    let tenant = TenantId::new("personal");
+
+    // A project-scoped memory owned by a DIFFERENT user: "use ripgrep".
+    let mut foreign = MemoryRecord::new_user_preference(
+        MemoryId::new("mem_foreign"),
+        tenant.clone(),
+        UserId::new("other"),
+        "Use ripgrep for search.",
+    );
+    foreign.scope = Scope::Project;
+    foreign.project_id = Some(project.clone());
+    foreign.visibility = Visibility::Project;
+    foreign.entities = vec!["ripgrep".to_string()];
+    let fpath = engine
+        .paths
+        .project_cortex_dir(&tenant, &project)
+        .join("mem_foreign.md");
+    write_memory(&fpath, &foreign).unwrap();
+
+    // kay submits + accepts a contradicting project memory ("avoid ripgrep").
+    // Supersession must NOT tombstone the other user's memory (no Write ACL).
+    let principal = Principal::personal("kay", "zode");
+    engine
+        .submit_candidate(RememberRequest {
+            principal: principal.clone(),
+            text: "Avoid ripgrep for search.".to_string(),
+            scope: crate::memory::Scope::Project,
+            project_path: Some(project_path.clone()),
+            kind: crate::memory::MemoryKind::Preference,
+            sensitivity: crate::sensitivity::SensitivityLevel::Internal,
+            tags: vec![],
+            entities: vec!["ripgrep".to_string()],
+            confidence: 0.95,
+            importance: 0.7,
+        })
+        .unwrap();
+    let pending = engine.review_list(&principal).unwrap();
+    let cand = pending
+        .first()
+        .expect("contradiction must queue for review");
+    engine
+        .review_decide(ReviewDecisionRequest {
+            principal: principal.clone(),
+            candidate_id: cand.id.to_string(),
+            action: ReviewAction::Accept,
+        })
+        .unwrap();
+
+    // The foreign memory must remain Active (not tombstoned by kay).
+    let reloaded = crate::store::read_memory(&fpath).unwrap();
+    assert_eq!(
+        reloaded.status,
+        crate::memory::MemoryStatus::Active,
+        "must not tombstone another user's memory"
+    );
+}
+
+#[test]
 fn recall_bumps_use_count_and_last_used_at() {
     let dir = tempfile::tempdir().unwrap();
     let engine = NoemaEngine::new(dir.path()).unwrap();

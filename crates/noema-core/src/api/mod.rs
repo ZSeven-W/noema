@@ -15,7 +15,9 @@ use crate::hippocampus::{
 };
 use crate::ids::{CandidateId, MemoryId, ProjectId, TenantId, UserId};
 use crate::lock::FileLock;
-use crate::memory::{AccessLevel, MemoryRecord, MemoryStatus, RecallMode, Scope, Visibility};
+use crate::memory::{
+    AccessLevel, MemoryLink, MemoryRecord, MemoryStatus, RecallMode, Scope, Visibility,
+};
 use crate::memorypack::{MemoryPack, MemoryPackItem};
 use crate::pageindex::PageIndex;
 use crate::paths::NoemaPaths;
@@ -285,6 +287,7 @@ impl NoemaEngine {
     }
 
     pub fn submit_candidate(&self, request: RememberRequest) -> Result<SubmitOutcome> {
+        let principal = request.principal.clone();
         let tenant = request.principal.tenant_id.clone();
         let user = request.principal.user_id.clone();
         self.init_personal(&user)?;
@@ -364,9 +367,25 @@ impl NoemaEngine {
                 })
             }
             CandidateRoute::AutoAccept => {
-                let memory = memory_from_candidate(&tenant, &user, &candidate);
+                let mut memory = memory_from_candidate(&tenant, &user, &candidate);
                 let path = memory_path(&self.paths, &tenant, &user, &memory)?;
+                // Persist the replacement FIRST, then supersede — so a failure
+                // tombstoning the old memory can never lose the fact without the
+                // new one having landed. (In practice `route_candidate` already
+                // routes conflicts to review, so the supersede set is empty here;
+                // kept for symmetry + robustness if routing changes.)
                 write_memory(&path, &memory)?;
+                let superseded =
+                    self.tombstone_conflicts(&tenant, &user, &principal, &candidate, &active);
+                if !superseded.is_empty() {
+                    for old_id in superseded {
+                        memory.links.push(MemoryLink {
+                            rel: "supersedes".to_string(),
+                            target: old_id,
+                        });
+                    }
+                    write_memory(&path, &memory)?;
+                }
                 self.audit(
                     &tenant,
                     &user,
@@ -390,6 +409,57 @@ impl NoemaEngine {
                 })
             }
         }
+    }
+
+    /// Tombstone every active memory the `candidate` directly contradicts (same
+    /// scope/kind, shared entity, opposing assertion) so a reversed preference
+    /// doesn't leave both versions on file. Returns the ids that were ACTUALLY
+    /// tombstoned, so the caller records `supersedes` links only for those (no
+    /// dangling link to a still-active memory).
+    ///
+    /// Must be called AFTER the replacement memory is persisted, so a failure
+    /// here can never delete the old fact without the new one having landed.
+    /// Each target is ACL-checked with [`principal_can_modify`] before mutation —
+    /// a candidate may never retire another user's memory (same gate as
+    /// `forget`). `active` is the already-loaded recall corpus.
+    fn tombstone_conflicts(
+        &self,
+        tenant: &TenantId,
+        user: &UserId,
+        principal: &Principal,
+        candidate: &Candidate,
+        active: &[MemoryRecord],
+    ) -> Vec<String> {
+        let mut superseded = Vec::new();
+        for id in crate::review::conflicting_memory_ids(candidate, active) {
+            let mid = MemoryId::new(&id);
+            let Some(path) = self.find_memory_path(tenant, user, &mid) else {
+                continue;
+            };
+            let Ok(mut memory) = read_memory(&path) else {
+                continue;
+            };
+            // Never tombstone a memory this principal isn't allowed to modify.
+            if !principal_can_modify(&memory, principal) {
+                continue;
+            }
+            memory.status = MemoryStatus::Tombstoned;
+            memory.recall_policy.mode = RecallMode::Never;
+            if write_memory(&path, &memory).is_err() {
+                continue;
+            }
+            let _ = self.audit(
+                tenant,
+                user,
+                memory.scope,
+                AuditAction::MemoryTombstoned,
+                None,
+                Some(mid.clone()),
+                Some("superseded".to_string()),
+            );
+            superseded.push(id);
+        }
+        superseded
     }
 
     /// Finds the on-disk path for a memory by ID, checking user cortex then all
@@ -555,11 +625,38 @@ impl NoemaEngine {
 
         match request.action {
             ReviewAction::Accept => {
-                let memory = memory_from_candidate(&tenant, &user, &candidate);
+                let mut memory = memory_from_candidate(&tenant, &user, &candidate);
                 let path = memory_path(&self.paths, &tenant, &user, &memory)?;
                 // Write memory BEFORE recording the decision: if the write fails
                 // the candidate stays pending and can be retried without data loss.
                 write_memory(&path, &memory)?;
+                // Supersede any active memory this one contradicts — AFTER the
+                // replacement has landed, ACL-checked, so a reviewed preference
+                // flip ("use X" → "avoid X") retires the old fact without risking
+                // its loss if the new write had failed. Link only the memories
+                // actually tombstoned (no dangling supersedes link).
+                let active = load_recall_memories(
+                    &self.paths,
+                    &tenant,
+                    &user,
+                    candidate.project_id.as_ref(),
+                )?;
+                let superseded = self.tombstone_conflicts(
+                    &tenant,
+                    &user,
+                    &request.principal,
+                    &candidate,
+                    &active,
+                );
+                if !superseded.is_empty() {
+                    for old_id in superseded {
+                        memory.links.push(MemoryLink {
+                            rel: "supersedes".to_string(),
+                            target: old_id,
+                        });
+                    }
+                    write_memory(&path, &memory)?;
+                }
                 append_decision(
                     &decisions_path,
                     &ReviewDecision::Accept {

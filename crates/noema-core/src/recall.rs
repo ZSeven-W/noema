@@ -177,15 +177,18 @@ pub fn recall(
     scored
 }
 
-/// A small boost for memories actually used recently, decaying linearly over
-/// ~30 days. Surfaces the "live" memory among lexical ties without overriding
-/// genuine relevance (kept well below the BM25 weight). Depends on the engine
-/// bumping `last_used_at` when a memory is served — see `NoemaEngine::recall`.
+/// A small boost for "live" memories, decaying linearly over ~30 days. Keyed on
+/// the most recent of `last_used_at` and `created_at`, so BOTH a recently-served
+/// memory AND a just-learned (never-served) one surface among lexical ties —
+/// without a never-served fresh preference being buried under an old one. Kept
+/// well below the BM25 weight so it only breaks ties. The engine bumps
+/// `last_used_at` when a memory is served (see `NoemaEngine::recall`).
 fn recency_boost(memory: &MemoryRecord) -> f32 {
-    let Some(last_used) = memory.last_used_at else {
-        return 0.0;
+    let reference = match memory.last_used_at {
+        Some(last_used) => last_used.max(memory.created_at),
+        None => memory.created_at,
     };
-    let age_days = (time::OffsetDateTime::now_utc() - last_used)
+    let age_days = (time::OffsetDateTime::now_utc() - reference)
         .whole_days()
         .max(0) as f32;
     (0.06 * (1.0 - age_days / 30.0)).max(0.0)
@@ -687,14 +690,45 @@ mod tests {
                 "Use Rust for the Noema memory system.",
             )
         };
-        let cold = make("mem_cold");
+        // Both were learned long ago (so creation freshness doesn't dominate);
+        // only `warm` has been served recently.
+        let mut cold = make("mem_cold");
+        cold.created_at = OffsetDateTime::now_utc() - Duration::days(60);
+        cold.updated_at = cold.created_at;
         let mut warm = make("mem_warm");
+        warm.created_at = OffsetDateTime::now_utc() - Duration::days(60);
+        warm.updated_at = warm.created_at;
         warm.last_used_at = Some(OffsetDateTime::now_utc() - Duration::hours(1));
 
         let results = recall("rust memory", &principal, None, &[cold, warm]);
         // Otherwise-identical memories tie on BM25; the recently-used one must
         // win so the "live" memory surfaces first.
         assert_eq!(results[0].id, "mem_warm", "{results:?}");
+    }
+
+    #[test]
+    fn recall_prefers_freshly_created_memory_even_if_never_used() {
+        use time::{Duration, OffsetDateTime};
+        let principal = Principal::personal("kay", "zode");
+        let make = |id: &str| {
+            MemoryRecord::new_user_preference(
+                MemoryId::new(id),
+                TenantId::new("personal"),
+                UserId::new("kay"),
+                "Use Rust for the Noema memory system.",
+            )
+        };
+        // Neither has ever been served (last_used_at = None). The stale one was
+        // created 60 days ago; the fresh one just now. The just-learned memory
+        // must surface first — a brand-new preference shouldn't be buried under
+        // an old never-served one that ties on BM25.
+        let mut stale = make("mem_stale");
+        stale.created_at = OffsetDateTime::now_utc() - Duration::days(60);
+        stale.updated_at = stale.created_at;
+        let fresh = make("mem_fresh"); // created_at defaults to now
+
+        let results = recall("rust memory", &principal, None, &[stale, fresh]);
+        assert_eq!(results[0].id, "mem_fresh", "{results:?}");
     }
 
     #[test]
